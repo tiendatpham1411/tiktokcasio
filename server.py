@@ -303,10 +303,16 @@ class ClientSession:
 
         # Send Metadata
         title = video_info.get("title", "").replace("\n", " ").replace("|", " ")
+        if len(title) > 60:
+            title = title[:60] + "..."
         author = video_info.get("author", {}).get("unique_id", "tiktok")
+        if len(author) > 24:
+            author = author[:24]
         likes = str(video_info.get("digg_count", 0))
         cmts = str(video_info.get("comment_count", 0))
         music = video_info.get("music_info", {}).get("title", "Sound").replace("|", " ")
+        if len(music) > 30:
+            music = music[:30]
         
         meta_line = f"META|{title}|{author}|{likes}|{cmts}|{music}|0"
         await self.send_text(meta_line)
@@ -329,15 +335,15 @@ class ClientSession:
 
     async def _stream_pipeline(self, play_url: str):
         try:
-            # FFmpeg video pipeline (optimized for low-spec cloud CPU)
+            # FFmpeg video pipeline (optimized for low-spec cloud CPU, NO -re so Python paces cleanly)
             video_cmd = [
-                "ffmpeg", "-re", "-threads", "1", "-i", play_url,
+                "ffmpeg", "-threads", "1", "-i", play_url,
                 "-vf", f"scale={FRAME_W}:{FRAME_H}:force_original_aspect_ratio=decrease:flags=fast_bilinear,pad={FRAME_W}:{FRAME_H}:(ow-iw)/2:(oh-ih)/2,format=gray",
                 "-f", "rawvideo", "-pix_fmt", "gray", "-r", "12", "-an", "-"
             ]
-            # FFmpeg audio pipeline (single thread, low overhead)
+            # FFmpeg audio pipeline (single thread, low overhead, NO -re so audio doesn't lag/stutter)
             audio_cmd = [
-                "ffmpeg", "-re", "-threads", "1", "-i", play_url,
+                "ffmpeg", "-threads", "1", "-i", play_url,
                 "-vn", "-acodec", "pcm_s16le", "-ac", "1", "-ar", f"{AUDIO_SAMPLE_RATE}",
                 "-f", "s16le", "-"
             ]
@@ -347,6 +353,7 @@ class ClientSession:
 
             loop = asyncio.get_event_loop()
             raw_frame_size = FRAME_W * FRAME_H
+            frame_idx = 0
             
             while self.is_active and self.is_playing:
                 frame_start = time.time()
@@ -360,8 +367,11 @@ class ClientSession:
                 frame_2bpp = image_to_2bpp(img, FRAME_W, FRAME_H)
                 await self.send_packet(PKT_VIDEO, frame_2bpp)
 
-                # Read corresponding audio chunks (~2666 bytes per frame at 12fps)
-                audio_bytes_needed = (AUDIO_SAMPLE_RATE * 2) // 12
+                # Accurate sample tracking: (32000 bytes/s across 12 FPS)
+                target_audio_bytes = int((frame_idx + 1) * (AUDIO_SAMPLE_RATE * 2) / 12) - int(frame_idx * (AUDIO_SAMPLE_RATE * 2) / 12)
+                frame_idx += 1
+
+                audio_bytes_needed = target_audio_bytes
                 while audio_bytes_needed > 0:
                     chunk_to_read = min(AUDIO_CHUNK_SIZE, audio_bytes_needed)
                     audio_chunk = await loop.run_in_executor(None, self.audio_proc.stdout.read, chunk_to_read)
@@ -370,10 +380,15 @@ class ClientSession:
                     await self.send_packet(PKT_AUDIO, audio_chunk)
                     audio_bytes_needed -= len(audio_chunk)
 
-                # Frame pacing: steady 12 FPS (83.3ms per frame) prevents network flooding
+                # Frame pacing: steady 12 FPS (83.3ms per frame)
                 elapsed = time.time() - frame_start
-                sleep_time = max(0.005, (1.0 / 12.0) - elapsed)
+                sleep_time = max(0.002, (1.0 / 12.0) - elapsed)
                 await asyncio.sleep(sleep_time)
+
+            if self.is_active and self.is_playing:
+                print("[Streamer] Video finished. Auto-playing next video...")
+                await asyncio.sleep(0.3)
+                await self.handle_command("CMD:NEXT_VIDEO")
 
         except asyncio.CancelledError:
             pass
