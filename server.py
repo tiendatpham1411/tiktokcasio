@@ -312,7 +312,9 @@ class ClientSession:
         await self.send_text(meta_line)
 
         # Send comments for this video
-        comments = TikTokService.fetch_comments(play_url, 15)
+        vid = video_info.get("video_id", video_info.get("id", ""))
+        web_post_url = f"https://www.tiktok.com/@{author}/video/{vid}" if vid else play_url
+        comments = TikTokService.fetch_comments(web_post_url, 15)
         await self.send_text("CMD:CLEAR")
         for c in comments:
             c_author = c.get("user", {}).get("unique_id", "user").replace("|", " ")
@@ -327,15 +329,15 @@ class ClientSession:
 
     async def _stream_pipeline(self, play_url: str):
         try:
-            # FFmpeg video pipeline
+            # FFmpeg video pipeline (optimized for low-spec cloud CPU)
             video_cmd = [
-                "ffmpeg", "-re", "-i", play_url,
-                "-vf", f"scale={FRAME_W}:{FRAME_H}:force_original_aspect_ratio=decrease,pad={FRAME_W}:{FRAME_H}:(ow-iw)/2:(oh-ih)/2,format=gray",
+                "ffmpeg", "-re", "-threads", "1", "-i", play_url,
+                "-vf", f"scale={FRAME_W}:{FRAME_H}:force_original_aspect_ratio=decrease:flags=fast_bilinear,pad={FRAME_W}:{FRAME_H}:(ow-iw)/2:(oh-ih)/2,format=gray",
                 "-f", "rawvideo", "-pix_fmt", "gray", "-r", "12", "-an", "-"
             ]
-            # FFmpeg audio pipeline
+            # FFmpeg audio pipeline (single thread, low overhead)
             audio_cmd = [
-                "ffmpeg", "-re", "-i", play_url,
+                "ffmpeg", "-re", "-threads", "1", "-i", play_url,
                 "-vn", "-acodec", "pcm_s16le", "-ac", "1", "-ar", f"{AUDIO_SAMPLE_RATE}",
                 "-f", "s16le", "-"
             ]
@@ -347,6 +349,7 @@ class ClientSession:
             raw_frame_size = FRAME_W * FRAME_H
             
             while self.is_active and self.is_playing:
+                frame_start = time.time()
                 # Read raw grayscale frame from ffmpeg
                 raw_gray = await loop.run_in_executor(None, self.video_proc.stdout.read, raw_frame_size)
                 if not raw_gray or len(raw_gray) < raw_frame_size:
@@ -357,7 +360,7 @@ class ClientSession:
                 frame_2bpp = image_to_2bpp(img, FRAME_W, FRAME_H)
                 await self.send_packet(PKT_VIDEO, frame_2bpp)
 
-                # Read corresponding audio chunks (~1200 bytes per frame at 12fps)
+                # Read corresponding audio chunks (~2666 bytes per frame at 12fps)
                 audio_bytes_needed = (AUDIO_SAMPLE_RATE * 2) // 12
                 while audio_bytes_needed > 0:
                     chunk_to_read = min(AUDIO_CHUNK_SIZE, audio_bytes_needed)
@@ -367,7 +370,10 @@ class ClientSession:
                     await self.send_packet(PKT_AUDIO, audio_chunk)
                     audio_bytes_needed -= len(audio_chunk)
 
-                await asyncio.sleep(0.001)
+                # Frame pacing: steady 12 FPS (83.3ms per frame) prevents network flooding
+                elapsed = time.time() - frame_start
+                sleep_time = max(0.005, (1.0 / 12.0) - elapsed)
+                await asyncio.sleep(sleep_time)
 
         except asyncio.CancelledError:
             pass
