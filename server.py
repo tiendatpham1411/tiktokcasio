@@ -108,7 +108,8 @@ class TikTokService:
     def fetch_feed(count: int = 10) -> List[Dict[str, Any]]:
         url = "https://www.tikwm.com/api/feed/list"
         params = {"region": "vn", "count": count}
-        headers = {"User-Agent": "Mozilla/5.0"}
+        # [SỬA MỚI] Đóng giả trình duyệt Chrome thực sự
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
         try:
             r = requests.get(url, params=params, headers=headers, timeout=10)
             data = r.json()
@@ -335,15 +336,23 @@ class ClientSession:
 
     async def _stream_pipeline(self, play_url: str):
         try:
-            # FFmpeg video pipeline (optimized for low-spec cloud CPU, NO -re so Python paces cleanly)
+            # [SỬA MỚI] Tạo User-Agent ngụy trang cực mạnh để đánh lừa máy chủ chứa video TikTok
+            fake_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+            # FFmpeg video pipeline
             video_cmd = [
-                "ffmpeg", "-threads", "1", "-i", play_url,
+                "ffmpeg", "-threads", "1", 
+                "-user_agent", fake_agent,  # <--- BẮT BUỘC THÊM DÒNG NÀY VÀO ĐÂY
+                "-i", play_url,
                 "-vf", f"scale={FRAME_W}:{FRAME_H}:force_original_aspect_ratio=decrease:flags=fast_bilinear,pad={FRAME_W}:{FRAME_H}:(ow-iw)/2:(oh-ih)/2,format=gray",
                 "-f", "rawvideo", "-pix_fmt", "gray", "-r", "12", "-an", "-"
             ]
-            # FFmpeg audio pipeline (single thread, low overhead, NO -re so audio doesn't lag/stutter)
+            
+            # FFmpeg audio pipeline
             audio_cmd = [
-                "ffmpeg", "-threads", "1", "-i", play_url,
+                "ffmpeg", "-threads", "1", 
+                "-user_agent", fake_agent,  # <--- BẮT BUỘC THÊM DÒNG NÀY VÀO ĐÂY
+                "-i", play_url,
                 "-vn", "-acodec", "pcm_s16le", "-ac", "1", "-ar", f"{AUDIO_SAMPLE_RATE}",
                 "-f", "s16le", "-"
             ]
@@ -402,9 +411,18 @@ class ClientSession:
         print(f"[CMD Received] {cmd_line}")
 
         if cmd_line == "CMD:READY" or cmd_line == "CMD:FEED":
+            # [SỬA MỚI] Gửi phản hồi ACK ngay lập tức để ESP32 biết Server đã sống
+            await self.send_toast("Đang tải dữ liệu...")
+            # [SỬA MỚI] Cho ESP32 một nhịp nghỉ (200ms) để render cái Toast kia trước khi bị dồn dập video
+            await asyncio.sleep(0.2)
+            
             self.current_feed = TikTokService.fetch_feed(10)
             self.current_video_idx = 0
-            await self.play_current_video()
+            
+            if not self.current_feed:
+                await self.send_toast("Lỗi tải danh sách video")
+            else:
+                await self.play_current_video()
 
         elif cmd_line == "CMD:NEXT_VIDEO":
             if self.current_video_idx + 1 < len(self.current_feed):
