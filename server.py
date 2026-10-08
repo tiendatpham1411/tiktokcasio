@@ -1,5 +1,5 @@
 """
-TikTok Cloud Streaming & API Server for FebonOS (ESP32-S3)
+FebonOS TikTok Cloud Streaming & API Server (Verbose Debug Edition)
 """
 
 import os
@@ -10,6 +10,7 @@ import asyncio
 import io
 import subprocess
 import requests
+import datetime
 from typing import Dict, Any, List, Optional
 from PIL import Image
 import qrcode
@@ -17,7 +18,7 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
-app = FastAPI(title="FebonOS TikTok Cloud Server")
+app = FastAPI(title="FebonOS TikTok Cloud Server [DEBUG]")
 
 MAGIC_BYTE = 0xAA
 PKT_VIDEO = 0x01
@@ -37,6 +38,10 @@ BAYER_4X4 = [
     [ 3, 11,  1,  9],
     [15,  7, 13,  5]
 ]
+
+def log(tag: str, msg: str):
+    now = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    print(f"[{now}][{tag}] {msg}", flush=True)
 
 # Session tái sử dụng kết nối HTTP
 http_session = requests.Session()
@@ -101,28 +106,36 @@ class TikTokService:
     def fetch_feed(count: int = 10) -> List[Dict[str, Any]]:
         url = "https://www.tikwm.com/api/feed/list"
         params = {"region": "vn", "count": count}
+        log("API", f"Calling TikWM feed API (timeout=10s): {url}")
+        
         for attempt in range(2):
             try:
-                r = http_session.get(url, params=params, headers=DEFAULT_HEADERS, timeout=(5, 12))
+                t0 = time.time()
+                r = http_session.get(url, params=params, headers=DEFAULT_HEADERS, timeout=(4, 10))
+                elapsed = time.time() - t0
+                log("API", f"Attempt {attempt+1}: Status={r.status_code}, Time={elapsed:.2f}s")
                 if r.status_code == 200:
                     data = r.json()
-                    if data.get("code") == 0 and "data" in data and len(data["data"]) > 0:
-                        return data["data"]
+                    feed = data.get("data", [])
+                    if data.get("code") == 0 and len(feed) > 0:
+                        log("API", f"Fetch feed thành công! Lấy được {len(feed)} videos.")
+                        return feed
+                    else:
+                        log("API", f"TikWM trả về mã lỗi code: {data.get('code')}, msg: {data.get('msg')}")
             except Exception as e:
-                print(f"[TikTok] Fetch feed attempt {attempt+1} error: {e}")
+                log("API_ERR", f"Attempt {attempt+1} fetch_feed error: {type(e).__name__} - {e}")
                 time.sleep(0.5)
 
-        # Fallback nguồn video dự phòng nếu TikWM bị nghẽn mạng trên Cloud
-        print("[TikTok] TikWM timeout, using fallback sample streams...")
+        log("API", "TikWM API không phản hồi! Kích hoạt video mẫu Fallback...")
         return [
             {
-                "id": "sample1",
-                "title": "Welcome to TikTok Casio (Demo Feed)",
+                "id": "sample_video_1",
+                "title": "FebonOS Demo Stream (Fallback)",
                 "play": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4",
-                "author": {"unique_id": "casio_system"},
-                "digg_count": 999,
-                "comment_count": 12,
-                "music_info": {"title": "Casio Beat"}
+                "author": {"unique_id": "casio_fx580"},
+                "digg_count": 8888,
+                "comment_count": 99,
+                "music_info": {"title": "Casio Sound Synthesizer"}
             }
         ]
 
@@ -130,33 +143,39 @@ class TikTokService:
     def search_videos(query: str, count: int = 10) -> List[Dict[str, Any]]:
         url = "https://www.tikwm.com/api/feed/search"
         params = {"keywords": query, "count": count}
+        log("API", f"Searching videos for: '{query}'")
         try:
             r = http_session.get(url, params=params, headers=DEFAULT_HEADERS, timeout=8)
             data = r.json()
             if data.get("code") == 0 and "data" in data:
                 res = data["data"]
-                return res.get("videos", res) if isinstance(res, dict) else res
+                items = res.get("videos", res) if isinstance(res, dict) else res
+                log("API", f"Tìm thấy {len(items)} kết quả cho '{query}'")
+                return items
         except Exception as e:
-            print(f"[TikTok] Search error: {e}")
+            log("API_ERR", f"Search error: {e}")
         return []
 
     @staticmethod
     def fetch_user_info(unique_id: str) -> Optional[Dict[str, Any]]:
         url = "https://www.tikwm.com/api/user/info"
         params = {"unique_id": unique_id}
+        log("API", f"Fetching user info: '{unique_id}'")
         try:
             r = http_session.get(url, params=params, headers=DEFAULT_HEADERS, timeout=8)
             data = r.json()
             if data.get("code") == 0 and "data" in data:
+                log("API", f"Lấy thành công user info: {unique_id}")
                 return data["data"]
         except Exception as e:
-            print(f"[TikTok] User info error: {e}")
+            log("API_ERR", f"User info error: {e}")
         return None
 
     @staticmethod
     def fetch_user_posts(unique_id: str, count: int = 12) -> List[Dict[str, Any]]:
         url = "https://www.tikwm.com/api/user/posts"
         params = {"unique_id": unique_id, "count": count, "cursor": 0}
+        log("API", f"Fetching user posts: '{unique_id}'")
         try:
             r = http_session.get(url, params=params, headers=DEFAULT_HEADERS, timeout=8)
             data = r.json()
@@ -164,32 +183,36 @@ class TikTokService:
                 res = data["data"]
                 return res.get("videos", []) if isinstance(res, dict) else res
         except Exception as e:
-            print(f"[TikTok] User posts error: {e}")
+            log("API_ERR", f"User posts error: {e}")
         return []
 
     @staticmethod
     def fetch_comments(video_url: str, count: int = 30) -> List[Dict[str, Any]]:
         url = "https://www.tikwm.com/api/comment/list"
         params = {"url": video_url, "count": count, "cursor": 0}
+        log("API", f"Fetching comments for: {video_url}")
         try:
             r = http_session.get(url, params=params, headers=DEFAULT_HEADERS, timeout=6)
             data = r.json()
             if data.get("code") == 0 and "data" in data:
                 res = data["data"]
-                return res.get("comments", []) if isinstance(res, dict) else res
+                cmts = res.get("comments", []) if isinstance(res, dict) else res
+                log("API", f"Lấy được {len(cmts)} bình luận.")
+                return cmts
         except Exception as e:
-            print(f"[TikTok] Comments error: {e}")
+            log("API_ERR", f"Comments error: {e}")
         return []
 
     @staticmethod
     def fetch_image_bitmap(url: str, w: int, h: int) -> Optional[bytes]:
+        log("IMG", f"Tải bitmap {w}x{h}: {url}")
         try:
             r = http_session.get(url, headers=DEFAULT_HEADERS, timeout=6)
             if r.status_code == 200:
                 img = Image.open(io.BytesIO(r.content))
                 return image_to_2bpp(img, w, h)
         except Exception as e:
-            print(f"[TikTok] Fetch image error ({url}): {e}")
+            log("IMG_ERR", f"Fetch image error: {e}")
         return None
 
 class TikTokQRLogin:
@@ -201,6 +224,7 @@ class TikTokQRLogin:
     def request_new_qr(self) -> Optional[bytes]:
         api_url = "https://www.tiktok.com/passport/web/get_qrcode/"
         params = {"aid": "1459", "language": "vi-VN"}
+        log("QR", "Requesting new QR Token từ TikTok Web...")
         try:
             r = http_session.get(api_url, params=params, headers=DEFAULT_HEADERS, timeout=6)
             res = r.json()
@@ -208,12 +232,13 @@ class TikTokQRLogin:
                 self.token = res["data"]["token"]
                 self.qr_url = res["data"].get("qrcode_index_url", f"https://www.tiktok.com/login/qr?token={self.token}")
                 self.status = "waiting"
+                log("QR", f"Token: {self.token}, URL: {self.qr_url}")
                 qr = qrcode.QRCode(version=1, box_size=1, border=1)
                 qr.add_data(self.qr_url)
                 qr.make(fit=True)
                 return qr_to_1bpp(qr.get_matrix(), 48)
         except Exception as e:
-            print(f"[QRLogin] Request QR error: {e}")
+            log("QR_ERR", f"Request QR error: {e}")
         return None
 
     def check_status(self) -> Dict[str, Any]:
@@ -227,14 +252,16 @@ class TikTokQRLogin:
             st = data.get("status", "")
             if st in ["confirmed", "scanned", "expired"]:
                 self.status = st
+                log("QR", f"Status changed: {st}")
                 return {"status": st, "data": data}
         except Exception as e:
-            print(f"[QRLogin] Check status error: {e}")
+            log("QR_ERR", f"Check status error: {e}")
         return {"status": self.status}
 
 class ClientSession:
-    def __init__(self, send_packet_fn):
+    def __init__(self, send_packet_fn, client_id: str = "Client"):
         self.send_packet = send_packet_fn
+        self.client_id = client_id
         self.current_feed: List[Dict[str, Any]] = []
         self.current_video_idx: int = 0
         self.is_playing: bool = True
@@ -248,36 +275,43 @@ class ClientSession:
         data = text.encode('utf-8')
         if not text.endswith('\n'):
             data += b'\n'
+        log("TX", f"[{self.client_id}] Send Text ({len(data)} bytes): {text.strip()}")
         await self.send_packet(PKT_TEXT, data)
 
     async def send_toast(self, msg: str):
         await self.send_text(f"TOAST|{msg}")
 
     def stop_streaming(self):
+        log("STREAM", f"[{self.client_id}] Stopping existing FFmpeg pipelines...")
         if self.video_proc:
             try:
                 self.video_proc.terminate()
+                self.video_proc.wait(timeout=0.5)
             except:
                 pass
             self.video_proc = None
         if self.audio_proc:
             try:
                 self.audio_proc.terminate()
+                self.audio_proc.wait(timeout=0.5)
             except:
                 pass
             self.audio_proc = None
         if self.stream_task and not self.stream_task.done():
             self.stream_task.cancel()
             self.stream_task = None
+        log("STREAM", f"[{self.client_id}] FFmpeg pipelines stopped.")
 
     async def play_current_video(self):
         self.stop_streaming()
         if not self.current_feed or self.current_video_idx >= len(self.current_feed):
+            log("STREAM", f"[{self.client_id}] Feed rỗng hoặc idx vượt giới hạn ({self.current_video_idx}/{len(self.current_feed)})")
             return
 
         video_info = self.current_feed[self.current_video_idx]
         play_url = video_info.get("play", "")
         if not play_url:
+            log("STREAM", f"[{self.client_id}] Không tìm thấy link play URL của video!")
             return
 
         title = video_info.get("title", "").replace("\n", " ").replace("|", " ")
@@ -293,10 +327,13 @@ class ClientSession:
             music = music[:30]
         
         meta_line = f"META|{title}|{author}|{likes}|{cmts}|{music}|0"
+        log("STREAM", f"[{self.client_id}] Phát Video [{self.current_video_idx}]: {title} ({author})")
         await self.send_text(meta_line)
 
-        # Chạy tác vụ fetch bình luận ở thread riêng để không block websocket
+        # Lấy bình luận chạy ngầm
         asyncio.create_task(self._load_comments_background(video_info, author, play_url))
+
+        # Khởi động pipeline FFmpeg
         self.stream_task = asyncio.create_task(self._stream_pipeline(play_url))
 
     async def _load_comments_background(self, video_info, author, play_url):
@@ -312,6 +349,7 @@ class ClientSession:
             await self.send_text(cmt_line)
 
     async def _stream_pipeline(self, play_url: str):
+        log("FFMPEG", f"[{self.client_id}] Khởi tạo tiến trình FFmpeg...")
         try:
             fake_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
@@ -333,6 +371,7 @@ class ClientSession:
 
             self.video_proc = subprocess.Popen(video_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             self.audio_proc = subprocess.Popen(audio_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            log("FFMPEG", f"[{self.client_id}] Tiến trình Video (PID={self.video_proc.pid}), Audio (PID={self.audio_proc.pid}) đã khởi động!")
 
             loop = asyncio.get_event_loop()
             raw_frame_size = FRAME_W * FRAME_H
@@ -342,6 +381,7 @@ class ClientSession:
                 frame_start = time.time()
                 raw_gray = await loop.run_in_executor(None, self.video_proc.stdout.read, raw_frame_size)
                 if not raw_gray or len(raw_gray) < raw_frame_size:
+                    log("STREAM", f"[{self.client_id}] Hết luồng video từ FFmpeg stdout.")
                     break
 
                 img = Image.frombytes('L', (FRAME_W, FRAME_H), raw_gray)
@@ -360,24 +400,28 @@ class ClientSession:
                     await self.send_packet(PKT_AUDIO, audio_chunk)
                     audio_bytes_needed -= len(audio_chunk)
 
+                if frame_idx % 60 == 0:
+                    log("STREAM", f"[{self.client_id}] Đã stream {frame_idx} frames (~{frame_idx//12} giây)")
+
                 elapsed = time.time() - frame_start
                 sleep_time = max(0.002, (1.0 / 12.0) - elapsed)
                 await asyncio.sleep(sleep_time)
 
             if self.is_active and self.is_playing:
+                log("STREAM", f"[{self.client_id}] Chuyển tiếp sang video kế tiếp...")
                 await asyncio.sleep(0.3)
                 await self.handle_command("CMD:NEXT_VIDEO")
 
         except asyncio.CancelledError:
-            pass
+            log("STREAM", f"[{self.client_id}] Stream task cancelled.")
         except Exception as e:
-            print(f"[Streamer] Pipeline error: {e}")
+            log("STREAM_ERR", f"[{self.client_id}] Pipeline error: {e}")
         finally:
             self.stop_streaming()
 
     async def handle_command(self, cmd_line: str):
         cmd_line = cmd_line.strip()
-        print(f"[CMD Received] {cmd_line}")
+        log("CMD", f"[{self.client_id}] Nhận lệnh: '{cmd_line}'")
 
         if cmd_line == "CMD:READY" or cmd_line == "CMD:FEED":
             await self.send_toast("Đang tải dữ liệu...")
@@ -402,6 +446,7 @@ class ClientSession:
 
         elif cmd_line == "CMD:TOGGLE_PLAY":
             self.is_playing = not self.is_playing
+            log("CMD", f"[{self.client_id}] Chế độ Play: {self.is_playing}")
             if self.is_playing and not self.stream_task:
                 await self.play_current_video()
 
@@ -512,39 +557,50 @@ class ClientSession:
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    client_ip = websocket.client.host if websocket.client else "unknown"
+    client_port = websocket.client.port if websocket.client else 0
+    cid = f"{client_ip}:{client_port}"
+    
+    log("WS_CONN", f"Incoming connection request from {cid}")
     await websocket.accept()
-    print("[WebSocket] ESP32 Connected!")
+    log("WS_CONN", f"WebSocket Accepted for {cid}!")
 
     async def send_packet(pkt_type: int, data: bytes):
         length = len(data)
         header = bytes([MAGIC_BYTE, pkt_type, (length >> 8) & 0xFF, length & 0xFF])
         await websocket.send_bytes(header + data)
 
-    session = ClientSession(send_packet)
+    session = ClientSession(send_packet, client_id=f"WS-{cid}")
 
     try:
         while True:
             message = await websocket.receive()
             if "text" in message:
-                await session.handle_command(message["text"])
+                text_cmd = message["text"]
+                log("WS_RX", f"[{cid}] Nhận WS Text Frame: '{text_cmd}'")
+                await session.handle_command(text_cmd)
             elif "bytes" in message:
                 raw = message["bytes"]
+                log("WS_RX", f"[{cid}] Nhận WS Binary Frame: {len(raw)} bytes")
                 if len(raw) >= 4 and raw[0] == MAGIC_BYTE:
                     pkt_type = raw[1]
                     payload = raw[4:]
                     if pkt_type == PKT_TEXT:
-                        await session.handle_command(payload.decode('utf-8', errors='ignore'))
+                        cmd_str = payload.decode('utf-8', errors='ignore')
+                        log("WS_RX", f"[{cid}] Binary Text Command: '{cmd_str}'")
+                        await session.handle_command(cmd_str)
     except WebSocketDisconnect:
-        print("[WebSocket] ESP32 Disconnected (Ngắt kết nối an toàn)")
+        log("WS_DISC", f"[{cid}] Client ngắt kết nối an toàn (WebSocketDisconnect)")
     except Exception as e:
-        print(f"[WebSocket] Lỗi đứt mạng đột ngột: {e}")
+        log("WS_ERR", f"[{cid}] Lỗi WebSocket đứt mạng: {e}")
     finally:
         session.is_active = False
         session.stop_streaming()
+        log("WS_END", f"[{cid}] Session kết thúc hoàn toàn.")
 
-# Lọc bỏ log Health Check của Render trên TCP port 5001
 async def handle_tcp_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     peer = writer.get_extra_info('peername')
+    log("TCP_CONN", f"TCP connection from {peer}")
 
     async def send_packet(pkt_type: int, data: bytes):
         length = len(data)
@@ -552,7 +608,7 @@ async def handle_tcp_client(reader: asyncio.StreamReader, writer: asyncio.Stream
         writer.write(header + data)
         await writer.drain()
 
-    session = ClientSession(send_packet)
+    session = ClientSession(send_packet, client_id=f"TCP-{peer}")
 
     try:
         while True:
@@ -560,34 +616,39 @@ async def handle_tcp_client(reader: asyncio.StreamReader, writer: asyncio.Stream
             if not line:
                 break
             cmd = line.decode('utf-8', errors='ignore').strip()
-            # Bỏ qua request dò cổng HTTP / Health Check của Render
+            # Bỏ qua log spam từ Render Health Check probe
             if cmd.startswith("HEAD ") or cmd.startswith("GET ") or cmd.startswith("Host:") or cmd.startswith("User-Agent:"):
                 continue
             if cmd:
+                log("TCP_RX", f"[{peer}] Command: '{cmd}'")
                 await session.handle_command(cmd)
-    except Exception:
-        pass
+    except Exception as e:
+        log("TCP_ERR", f"[{peer}] Error: {e}")
     finally:
         session.is_active = False
         session.stop_streaming()
         try:
             writer.close()
             await writer.wait_closed()
-        except Exception:
+        except:
             pass
+        log("TCP_DISC", f"TCP client disconnected: {peer}")
 
 @app.on_event("startup")
 async def startup_event():
+    log("INIT", "Khởi động Server...")
     try:
         server = await asyncio.start_server(handle_tcp_client, "0.0.0.0", 5001)
+        log("INIT", "TCP Server đang lắng nghe trên cổng 5001")
         asyncio.create_task(server.serve_forever())
     except Exception as e:
-        print(f"[TCP Server] Error binding 5001: {e}")
+        log("INIT_ERR", f"Không thể lắng nghe cổng TCP 5001 (có thể do môi trường Cloud hạn chế đa port): {e}")
 
 @app.get("/")
 def index():
-    return HTMLResponse("<h1>FebonOS TikTok Cloud Streamer ONLINE</h1>")
+    return HTMLResponse("<h1>FebonOS TikTok Cloud Streamer [DEBUG MODE ACTIVE]</h1>")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
+    log("INIT", f"Chạy Uvicorn trên cổng {port}...")
     uvicorn.run(app, host="0.0.0.0", port=port)
