@@ -353,9 +353,18 @@ class ClientSession:
         try:
             fake_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
+            # Bổ sung các cờ chống treo mạng cho ffmpeg
+            net_opts = [
+                "-reconnect", "1",
+                "-reconnect_streamed", "1",
+                "-reconnect_delay_max", "5",
+                "-rw_timeout", "10000000", # 10 giây timeout
+                "-user_agent", fake_agent
+            ]
+
             video_cmd = [
                 "ffmpeg", "-threads", "1",
-                "-user_agent", fake_agent,
+                *net_opts,
                 "-i", play_url,
                 "-vf", f"scale={FRAME_W}:{FRAME_H}:force_original_aspect_ratio=decrease:flags=fast_bilinear,pad={FRAME_W}:{FRAME_H}:(ow-iw)/2:(oh-ih)/2,format=gray",
                 "-f", "rawvideo", "-pix_fmt", "gray", "-r", "12", "-an", "-"
@@ -363,11 +372,12 @@ class ClientSession:
             
             audio_cmd = [
                 "ffmpeg", "-threads", "1",
-                "-user_agent", fake_agent,
+                *net_opts,
                 "-i", play_url,
                 "-vn", "-acodec", "pcm_s16le", "-ac", "1", "-ar", f"{AUDIO_SAMPLE_RATE}",
                 "-f", "s16le", "-"
             ]
+
 
             self.video_proc = subprocess.Popen(video_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             self.audio_proc = subprocess.Popen(audio_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -646,7 +656,7 @@ async def startup_event():
             asyncio.create_task(server.serve_forever())
         except Exception as e:
             log("INIT_ERR", f"Lỗi mở cổng TCP 5001: {e}")
-            
+
 @app.get("/")
 def index():
     return HTMLResponse("<h1>FebonOS TikTok Cloud Streamer [DEBUG MODE ACTIVE]</h1>")
