@@ -636,14 +636,17 @@ async def handle_tcp_client(reader: asyncio.StreamReader, writer: asyncio.Stream
 
 @app.on_event("startup")
 async def startup_event():
-    log("INIT", "Khởi động Server...")
-    try:
-        server = await asyncio.start_server(handle_tcp_client, "0.0.0.0", 5001)
-        log("INIT", "TCP Server đang lắng nghe trên cổng 5001")
-        asyncio.create_task(server.serve_forever())
-    except Exception as e:
-        log("INIT_ERR", f"Không thể lắng nghe cổng TCP 5001 (có thể do môi trường Cloud hạn chế đa port): {e}")
-
+    log("INIT", "FastAPI Service đã khởi động!")
+    # Chỉ mở TCP port 5001 nếu chạy local trên máy tính cá nhân
+    # Trên Render, biến môi trường RENDER=true luôn tồn tại
+    if not os.environ.get("RENDER"):
+        try:
+            server = await asyncio.start_server(handle_tcp_client, "0.0.0.0", 5001)
+            log("INIT", "TCP Server đang lắng nghe trên cổng 5001 (Local Mode)")
+            asyncio.create_task(server.serve_forever())
+        except Exception as e:
+            log("INIT_ERR", f"Lỗi mở cổng TCP 5001: {e}")
+            
 @app.get("/")
 def index():
     return HTMLResponse("<h1>FebonOS TikTok Cloud Streamer [DEBUG MODE ACTIVE]</h1>")
