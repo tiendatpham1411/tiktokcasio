@@ -411,16 +411,15 @@ class ClientSession:
         print(f"[CMD Received] {cmd_line}")
 
         if cmd_line == "CMD:READY" or cmd_line == "CMD:FEED":
-            # [SỬA MỚI] Gửi phản hồi ACK ngay lập tức để ESP32 biết Server đã sống
             await self.send_toast("Đang tải dữ liệu...")
-            # [SỬA MỚI] Cho ESP32 một nhịp nghỉ (200ms) để render cái Toast kia trước khi bị dồn dập video
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.1) # Nhịp nghỉ để ESP32 vẽ chữ
             
-            self.current_feed = TikTokService.fetch_feed(10)
+            # [SỬA MỚI] Đẩy tác vụ gọi API sang luồng phụ để không treo máy chủ
+            self.current_feed = await asyncio.to_thread(TikTokService.fetch_feed, 10)
             self.current_video_idx = 0
             
             if not self.current_feed:
-                await self.send_toast("Lỗi tải danh sách video")
+                await self.send_toast("Lỗi API: TikWM chặn IP Render!")
             else:
                 await self.play_current_video()
 
@@ -586,7 +585,10 @@ async def websocket_endpoint(websocket: WebSocket):
                     if pkt_type == PKT_TEXT:
                         await session.handle_command(payload.decode('utf-8', errors='ignore'))
     except WebSocketDisconnect:
-        print("[WebSocket] ESP32 Disconnected")
+        print("[WebSocket] ESP32 Disconnected (Ngắt kết nối an toàn)")
+    except Exception as e:
+        # [SỬA MỚI] Bắt gọn lỗi đứt cáp đột ngột để Server không bị sập
+        print(f"[WebSocket] Lỗi đứt mạng đột ngột: {e}")
     finally:
         session.is_active = False
         session.stop_streaming()
