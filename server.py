@@ -108,10 +108,10 @@ class TikTokService:
         params = {"region": "vn", "count": count}
         log("API", f"Calling TikWM feed API (timeout=10s): {url}")
         
-        for attempt in range(2):
+        for attempt in range(1):
             try:
                 t0 = time.time()
-                r = http_session.get(url, params=params, headers=DEFAULT_HEADERS, timeout=(4, 10))
+                r = http_session.get(url, params=params, headers=DEFAULT_HEADERS, timeout=(2, 3))
                 elapsed = time.time() - t0
                 log("API", f"Attempt {attempt+1}: Status={r.status_code}, Time={elapsed:.2f}s")
                 if r.status_code == 200:
@@ -124,7 +124,6 @@ class TikTokService:
                         log("API", f"TikWM trả về mã lỗi code: {data.get('code')}, msg: {data.get('msg')}")
             except Exception as e:
                 log("API_ERR", f"Attempt {attempt+1} fetch_feed error: {type(e).__name__} - {e}")
-                time.sleep(0.5)
 
         log("API", "TikWM API không phản hồi! Kích hoạt video mẫu Fallback...")
         return [
