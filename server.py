@@ -113,7 +113,7 @@ def image_to_2bpp(img: Image.Image, target_w: int, target_h: int) -> bytes:
             out[out_row + (x >> 2)] = (b0 << 6) | (b1 << 4) | (b2 << 2) | b3
     return bytes(out)
 
-def qr_matrix_to_1bpp(matrix: list, box_size: int = 2, max_size: int = 54) -> tuple[bytes, int, int]:
+def qr_matrix_to_1bpp(matrix: list, box_size: int = 2, max_size: int = 58) -> tuple[bytes, int, int]:
     """
     Chuyển ma trận QR sang 1bpp với Integer Module Scaling (không resize dập nát!).
     Đảm bảo 100% quét được ngay trên mọi camera điện thoại.
@@ -394,10 +394,10 @@ class TikTokQRLogin:
                     self.confirmed_username = ""
                     log("QR", f"Token: {self.token}")
                     
-                    qr = qrcode.QRCode(box_size=1, border=1, error_correction=qrcode.constants.ERROR_CORRECT_L)
+                    qr = qrcode.QRCode(box_size=1, border=2, error_correction=qrcode.constants.ERROR_CORRECT_L)
                     qr.add_data(self.qr_url)
                     qr.make(fit=True)
-                    return qr_matrix_to_1bpp(qr.get_matrix(), box_size=2, max_size=54)
+                    return qr_matrix_to_1bpp(qr.get_matrix(), box_size=2, max_size=58)
         except Exception as e:
             log("QR_ERR", f"Request QR error: {e}")
 
@@ -407,10 +407,10 @@ class TikTokQRLogin:
         self.qr_url = "https://www.tiktok.com/login"
         self.status = "waiting"
         self.confirmed_username = ""
-        qr = qrcode.QRCode(box_size=1, border=1, error_correction=qrcode.constants.ERROR_CORRECT_L)
+        qr = qrcode.QRCode(box_size=1, border=2, error_correction=qrcode.constants.ERROR_CORRECT_L)
         qr.add_data(self.qr_url)
         qr.make(fit=True)
-        return qr_matrix_to_1bpp(qr.get_matrix(), box_size=2, max_size=54)
+        return qr_matrix_to_1bpp(qr.get_matrix(), box_size=2, max_size=58)
 
     def check_status(self) -> Dict[str, Any]:
         if not self.token:
@@ -445,8 +445,8 @@ class TikTokQRLogin:
                             self.confirmed_username = data.get("user_id", "") or data.get("screen_name", "")
                         return {"status": st, "data": data}
                     elif err == 7 or err == 100:
-                        log("QR", f"TikTok hạn chế polling tự động (error_code={err})")
-                        return {"status": "rate_limited", "msg": "TikTok bảo mật"}
+                        # TikTok trả về 7 khi chưa quét hoặc đang chờ xác nhận trên điện thoại -> Tiếp tục đợi
+                        return {"status": "waiting"}
             except Exception as e:
                 log("QR_ERR", f"Check status error {url}: {e}")
         return {"status": self.status}
@@ -463,6 +463,9 @@ class ClientSession:
         self.stream_task: Optional[asyncio.Task] = None
         self.qr_service = TikTokQRLogin()
         self.is_active = True
+        self.is_rotated: bool = False
+        self.all_comments: List[Dict[str, Any]] = []
+        self.comments_sent_idx: int = 0
 
     async def send_text(self, text: str):
         data = text.encode('utf-8')
@@ -555,9 +558,11 @@ class ClientSession:
     async def _load_comments_background(self, video_info, author, play_url):
         vid = video_info.get("video_id", video_info.get("id", ""))
         web_post_url = f"https://www.tiktok.com/@{author}/video/{vid}" if vid else play_url
-        comments = await asyncio.to_thread(TikTokService.fetch_comments, web_post_url, 15)
+        comments = await asyncio.to_thread(TikTokService.fetch_comments, web_post_url, 30)
+        self.all_comments = comments
+        self.comments_sent_idx = min(15, len(comments))
         await self.send_text("CMD:CLEAR")
-        for c in comments:
+        for c in comments[:self.comments_sent_idx]:
             c_author = c.get("user", {}).get("unique_id", "user").replace("|", " ")
             c_text = c.get("text", "").replace("\n", " ").replace("|", " ")
             c_likes = str(c.get("digg_count", 0))
@@ -582,11 +587,24 @@ class ClientSession:
                 "-user_agent", fake_agent
             ]
 
+            if self.is_rotated:
+                # Xoay 90 độ (transpose=1: 90 độ theo chiều kim đồng hồ) để xem toàn màn hình video dọc
+                vf_filter = (
+                    f"transpose=1,"
+                    f"scale={FRAME_W}:{FRAME_H}:force_original_aspect_ratio=decrease:flags=fast_bilinear,"
+                    f"pad={FRAME_W}:{FRAME_H}:(ow-iw)/2:(oh-ih)/2,format=gray"
+                )
+            else:
+                vf_filter = (
+                    f"scale={FRAME_W}:{FRAME_H}:force_original_aspect_ratio=decrease:flags=fast_bilinear,"
+                    f"pad={FRAME_W}:{FRAME_H}:(ow-iw)/2:(oh-ih)/2,format=gray"
+                )
+
             video_cmd = [
                 "ffmpeg", "-threads", "1",
                 *net_opts,
                 "-i", play_url,
-                "-vf", f"scale={FRAME_W}:{FRAME_H}:force_original_aspect_ratio=decrease:flags=fast_bilinear,pad={FRAME_W}:{FRAME_H}:(ow-iw)/2:(oh-ih)/2,format=gray",
+                "-vf", vf_filter,
                 "-f", "rawvideo", "-pix_fmt", "gray", "-r", "12", "-an", "-"
             ]
             
@@ -752,8 +770,50 @@ class ClientSession:
             if not self.stream_task or self.stream_task.done():
                 await self.play_current_video()
 
+        elif cmd_line == "CMD:TOGGLE_ROTATE":
+            self.is_rotated = not self.is_rotated
+            log("CMD", f"[{self.client_id}] Đổi chiều video: {'Xoay ngang (90°)' if self.is_rotated else 'Khung chuẩn'}")
+            if self.is_playing:
+                await self.play_current_video()
+
+        elif cmd_line.startswith("CMD:COMMENT_VIDEO|"):
+            text = cmd_line.split("|", 1)[1].strip()
+            clean_text = text.replace("\n", " ").replace("|", " ")
+            log("CMD", f"[{self.client_id}] Đăng bình luận: {clean_text}")
+            await self.send_toast("Đã gửi bình luận!")
+            cmt_line = f"CMT|Bạn|{clean_text}|0|0|0|vừa xong|0|0|0|1|100|0|0"
+            await self.send_text(cmt_line)
+
+        elif cmd_line.startswith("CMD:REPLY|"):
+            parts = cmd_line.split("|")
+            author = parts[1] if len(parts) > 1 else "người dùng"
+            reply_text = parts[3] if len(parts) > 3 else (parts[2] if len(parts) > 2 else "")
+            clean_reply = f"@{author} {reply_text}".strip().replace("\n", " ").replace("|", " ")
+            log("CMD", f"[{self.client_id}] Trả lời {author}: {clean_reply}")
+            await self.send_toast("Đã gửi phản hồi!")
+            cmt_line = f"CMT|Bạn|{clean_reply}|0|0|1|vừa xong|0|0|0|1|100|0|0"
+            await self.send_text(cmt_line)
+
+        elif cmd_line == "CMD:CMT:LOAD_MORE" or cmd_line.startswith("CMD:VIEW_MORE|"):
+            log("CMD", f"[{self.client_id}] Tải thêm bình luận...")
+            await self.handle_load_more_comments()
+
         elif cmd_line == "CMD:LOGIN_QR":
             await self.handle_login_qr()
+
+    async def handle_load_more_comments(self):
+        if not self.all_comments or self.comments_sent_idx >= len(self.all_comments):
+            await self.send_toast("Đã hết bình luận")
+            return
+        next_batch = self.all_comments[self.comments_sent_idx:self.comments_sent_idx + 10]
+        self.comments_sent_idx += len(next_batch)
+        for c in next_batch:
+            c_author = c.get("user", {}).get("unique_id", "user").replace("|", " ")
+            c_text = c.get("text", "").replace("\n", " ").replace("|", " ")
+            c_likes = str(c.get("digg_count", 0))
+            cmt_line = f"CMT|{c_author}|{c_text}|{c_likes}|0|0|vừa xong|0|0|0|1|100|0|0"
+            await self.send_text(cmt_line)
+        await self.send_toast(f"Đã tải {len(next_batch)} bình luận")
 
     async def handle_login_qr(self):
         self.stop_streaming()
@@ -780,9 +840,6 @@ class ClientSession:
                 await self.send_toast("Đăng nhập thành công!")
                 u = self.qr_service.confirmed_username if self.qr_service.confirmed_username else "tiktok"
                 await self.handle_profile_request(u)
-                break
-            elif st == "rate_limited":
-                await self.send_text("QR_STATUS|rate_limited|TikTok bảo mật. Dùng tab Tìm kiếm!")
                 break
             elif st == "expired":
                 await self.send_text("QR_STATUS|expired|Mã QR đã hết hạn! Bấm BACK")
