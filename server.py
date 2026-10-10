@@ -328,20 +328,28 @@ class TikTokQRLogin:
         self.token = ""
         self.qr_url = ""
         self.status = "idle"
+        self.csrf_token = ""
+        self.confirmed_username = ""
 
     def request_new_qr(self) -> Optional[tuple[bytes, int, int]]:
-        api_url = "https://www.tiktok.com/passport/web/get_qrcode/"
-        params = {"aid": "1459", "language": "vi-VN", "next": "https://www.tiktok.com/"}
-        qr_headers = {**DEFAULT_HEADERS, "Referer": "https://www.tiktok.com/"}
+        api_url = "https://www.tiktok.com/passport/web/get_qrcode/?next=https%3A%2F%2Fwww.tiktok.com&aid=1459"
+        qr_headers = {
+            **DEFAULT_HEADERS,
+            "Referer": "https://www.tiktok.com/login",
+            "Origin": "https://www.tiktok.com",
+            "Accept": "application/json, text/javascript"
+        }
         log("QR", "Requesting new QR Token từ TikTok Web...")
         try:
-            r = http_session.get(api_url, params=params, headers=qr_headers, timeout=6)
+            r = http_session.post(api_url, data={}, headers=qr_headers, timeout=8)
             if r.status_code == 200:
                 res = r.json()
                 if res.get("data", {}).get("token"):
                     self.token = res["data"]["token"]
                     self.qr_url = res["data"].get("qrcode_index_url", f"https://www.tiktok.com/login/qr?token={self.token}")
                     self.status = "waiting"
+                    self.csrf_token = r.cookies.get("passport_csrf_token", "")
+                    self.confirmed_username = ""
                     log("QR", f"Token: {self.token}, URL: {self.qr_url}")
                     
                     qr = qrcode.QRCode(box_size=1, border=1, error_correction=qrcode.constants.ERROR_CORRECT_L)
@@ -356,6 +364,7 @@ class TikTokQRLogin:
         self.token = f"casio_{int(time.time())}"
         self.qr_url = "https://www.tiktok.com/login"
         self.status = "waiting"
+        self.confirmed_username = ""
         qr = qrcode.QRCode(box_size=1, border=1, error_correction=qrcode.constants.ERROR_CORRECT_L)
         qr.add_data(self.qr_url)
         qr.make(fit=True)
@@ -364,18 +373,40 @@ class TikTokQRLogin:
     def check_status(self) -> Dict[str, Any]:
         if not self.token:
             return {"status": "idle"}
-        api_url = "https://www.tiktok.com/passport/web/check_qrconnect/"
-        params = {"aid": "1459", "token": self.token}
-        try:
-            r = http_session.get(api_url, params=params, headers=DEFAULT_HEADERS, timeout=5)
-            data = r.json().get("data", {})
-            st = data.get("status", "")
-            if st in ["confirmed", "scanned", "expired"]:
-                self.status = st
-                log("QR", f"Status changed: {st}")
-                return {"status": st, "data": data}
-        except Exception as e:
-            log("QR_ERR", f"Check status error: {e}")
+        if self.token.startswith("casio_"):
+            return {"status": "waiting"}
+
+        api_urls = [
+            f"https://web-va.tiktok.com/passport/web/check_qrconnect/?next=https%3A%2F%2Fwww.tiktok.com&token={self.token}&aid=1459",
+            f"https://www.tiktok.com/passport/web/check_qrconnect/?next=https%3A%2F%2Fwww.tiktok.com&token={self.token}&aid=1459"
+        ]
+        headers = {
+            **DEFAULT_HEADERS,
+            "Referer": "https://www.tiktok.com/login",
+            "Accept": "application/json, text/javascript"
+        }
+        if self.csrf_token:
+            headers["x-tt-passport-csrf-token"] = self.csrf_token
+            headers["cookie"] = f"passport_csrf_token={self.csrf_token};"
+
+        for url in api_urls:
+            try:
+                r = http_session.get(url, headers=headers, timeout=5)
+                if r.status_code == 200:
+                    data = r.json().get("data", {})
+                    st = data.get("status", "")
+                    err = data.get("error_code", 0)
+                    if st in ["confirmed", "scanned", "expired"]:
+                        self.status = st
+                        log("QR", f"Status changed: {st}")
+                        if st == "confirmed":
+                            self.confirmed_username = data.get("user_id", "") or data.get("screen_name", "")
+                        return {"status": st, "data": data}
+                    elif err == 7 or err == 100:
+                        log("QR", f"TikTok hạn chế polling tự động (error_code={err})")
+                        return {"status": "rate_limited", "msg": "TikTok bảo mật"}
+            except Exception as e:
+                log("QR_ERR", f"Check status error {url}: {e}")
         return {"status": self.status}
 
 class ClientSession:
@@ -643,7 +674,7 @@ class ClientSession:
             await self.send_toast("Lỗi tạo mã QR")
 
     async def _poll_qr_status(self):
-        for _ in range(30):
+        for tick in range(35):
             await asyncio.sleep(2)
             if not self.is_active or self.qr_service.status not in ["waiting", "scanned"]:
                 break
@@ -654,11 +685,18 @@ class ClientSession:
             elif st == "confirmed":
                 await self.send_text("QR_STATUS|confirmed|Đăng nhập thành công!")
                 await self.send_toast("Đăng nhập thành công!")
-                await self.handle_profile_request("tiktok")
+                u = self.qr_service.confirmed_username if self.qr_service.confirmed_username else "tiktok"
+                await self.handle_profile_request(u)
+                break
+            elif st == "rate_limited":
+                await self.send_text("QR_STATUS|rate_limited|TikTok bảo mật. Dùng tab Tìm kiếm!")
                 break
             elif st == "expired":
-                await self.send_text("QR_STATUS|expired|Mã QR đã hết hạn!")
+                await self.send_text("QR_STATUS|expired|Mã QR đã hết hạn! Bấm BACK")
                 break
+        else:
+            if self.is_active and self.qr_service.status == "waiting":
+                await self.send_text("QR_STATUS|timeout|Hết giờ quét mã. Bấm BACK")
 
     async def handle_profile_request(self, username: str):
         self.stop_streaming()
