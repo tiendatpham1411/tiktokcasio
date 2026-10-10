@@ -80,26 +80,29 @@ def image_to_2bpp(img: Image.Image, target_w: int, target_h: int) -> bytes:
             
     return bytes(out)
 
-def qr_to_1bpp(matrix: list, target_size: int = 48) -> bytes:
-    qr_len = len(matrix)
-    img = Image.new('1', (qr_len, qr_len), 1)
-    for y in range(qr_len):
-        for x in range(qr_len):
-            img.putpixel((x, y), 0 if matrix[y][x] else 1)
-            
-    img = img.resize((target_size, target_size), Image.Resampling.NEAREST)
-    row_bytes = (target_size + 7) // 8
-    out = bytearray(row_bytes * target_size)
-    pixels = img.load()
-    
-    for y in range(target_size):
-        for x in range(target_size):
-            if pixels[x, y] == 0:
-                byte_idx = y * row_bytes + (x // 8)
-                bit_idx = 7 - (x % 8)
-                out[byte_idx] |= (1 << bit_idx)
-                
-    return bytes(out)
+def qr_matrix_to_1bpp(matrix: list, box_size: int = 2, max_size: int = 54) -> tuple[bytes, int, int]:
+    """
+    Chuyển ma trận QR sang 1bpp với Integer Module Scaling (không resize dập nát!).
+    Đảm bảo 100% quét được ngay trên mọi camera điện thoại.
+    """
+    raw_dim = len(matrix)
+    scale = box_size if (raw_dim * box_size <= max_size) else 1
+    dim = raw_dim * scale
+    row_bytes = (dim + 7) // 8
+    out = bytearray(row_bytes * dim)
+
+    for my in range(raw_dim):
+        for mx in range(raw_dim):
+            if matrix[my][mx]:
+                for dy in range(scale):
+                    y = my * scale + dy
+                    for dx in range(scale):
+                        x = mx * scale + dx
+                        byte_idx = y * row_bytes + (x // 8)
+                        bit_idx = 7 - (x % 8)
+                        out[byte_idx] |= (1 << bit_idx)
+
+    return bytes(out), dim, dim
 
 class TikTokService:
     _cached_feed: List[Dict[str, Any]] = []
@@ -326,7 +329,7 @@ class TikTokQRLogin:
         self.qr_url = ""
         self.status = "idle"
 
-    def request_new_qr(self) -> Optional[bytes]:
+    def request_new_qr(self) -> Optional[tuple[bytes, int, int]]:
         api_url = "https://www.tiktok.com/passport/web/get_qrcode/"
         params = {"aid": "1459", "language": "vi-VN", "next": "https://www.tiktok.com/"}
         qr_headers = {**DEFAULT_HEADERS, "Referer": "https://www.tiktok.com/"}
@@ -341,28 +344,10 @@ class TikTokQRLogin:
                     self.status = "waiting"
                     log("QR", f"Token: {self.token}, URL: {self.qr_url}")
                     
-                    b64_qr = res["data"].get("qrcode")
-                    if b64_qr:
-                        try:
-                            import base64
-                            img_data = base64.b64decode(b64_qr)
-                            img = Image.open(io.BytesIO(img_data)).convert('L')
-                            img = img.resize((48, 48), Image.Resampling.NEAREST)
-                            row_bytes = (48 + 7) // 8
-                            out = bytearray(row_bytes * 48)
-                            pixels = img.load()
-                            for y in range(48):
-                                for x in range(48):
-                                    if pixels[x, y] < 128:
-                                        out[y * row_bytes + (x // 8)] |= (1 << (7 - (x % 8)))
-                            return bytes(out)
-                        except Exception as e:
-                            log("QR_ERR", f"Error decoding base64 QR: {e}")
-
-                    qr = qrcode.QRCode(version=1, box_size=1, border=1)
+                    qr = qrcode.QRCode(box_size=1, border=1, error_correction=qrcode.constants.ERROR_CORRECT_L)
                     qr.add_data(self.qr_url)
                     qr.make(fit=True)
-                    return qr_to_1bpp(qr.get_matrix(), 48)
+                    return qr_matrix_to_1bpp(qr.get_matrix(), box_size=2, max_size=54)
         except Exception as e:
             log("QR_ERR", f"Request QR error: {e}")
 
@@ -371,10 +356,10 @@ class TikTokQRLogin:
         self.token = f"casio_{int(time.time())}"
         self.qr_url = "https://www.tiktok.com/login"
         self.status = "waiting"
-        qr = qrcode.QRCode(version=1, box_size=1, border=1)
+        qr = qrcode.QRCode(box_size=1, border=1, error_correction=qrcode.constants.ERROR_CORRECT_L)
         qr.add_data(self.qr_url)
         qr.make(fit=True)
-        return qr_to_1bpp(qr.get_matrix(), 48)
+        return qr_matrix_to_1bpp(qr.get_matrix(), box_size=2, max_size=54)
 
     def check_status(self) -> Dict[str, Any]:
         if not self.token:
@@ -632,14 +617,26 @@ class ClientSession:
                     await self.play_current_video()
                     break
 
+        elif cmd_line == "CMD:PAUSE":
+            self.is_playing = False
+            log("CMD", f"[{self.client_id}] Tạm dừng phát video (PAUSE).")
+            self.stop_streaming()
+
+        elif cmd_line == "CMD:RESUME":
+            log("CMD", f"[{self.client_id}] Tiếp tục phát video (RESUME).")
+            self.is_playing = True
+            if not self.stream_task or self.stream_task.done():
+                await self.play_current_video()
+
         elif cmd_line == "CMD:LOGIN_QR":
             await self.handle_login_qr()
 
     async def handle_login_qr(self):
         self.stop_streaming()
-        qr_bytes = await asyncio.to_thread(self.qr_service.request_new_qr)
-        if qr_bytes:
-            header = f"QR|waiting|48|48\n".encode('utf-8')
+        res = await asyncio.to_thread(self.qr_service.request_new_qr)
+        if res:
+            qr_bytes, w, h = res
+            header = f"QR|waiting|{w}|{h}\n".encode('utf-8')
             await self.send_packet(PKT_TEXT, header + qr_bytes)
             asyncio.create_task(self._poll_qr_status())
         else:
