@@ -137,6 +137,29 @@ def qr_matrix_to_1bpp(matrix: list, box_size: int = 2, max_size: int = 58) -> tu
 
     return bytes(out), dim, dim
 
+def generate_identicon_2bpp(name: str, w: int = 16, h: int = 16) -> bytes:
+    """
+    Tạo avatar 16x16 2bpp sắc nét theo mã băm tên người dùng (Identicon).
+    Đảm bảo 100% bình luận đều có avatar hiển thị đẹp mắt trên Casio FX-580.
+    """
+    import hashlib
+    h_val = int(hashlib.md5(name.encode('utf-8')).hexdigest()[:8], 16)
+    out = bytearray((w // 4) * h)
+    for y in range(h):
+        for x in range(w // 2):
+            bit = ((h_val >> ((y * 3 + x) % 29)) & 1)
+            shade = 0 if bit else 3
+            # Điểm bên trái
+            byte_l = y * 4 + (x >> 2)
+            shift_l = 6 - (2 * (x & 3))
+            out[byte_l] |= (shade << shift_l)
+            # Điểm đối xứng bên phải
+            xr = w - 1 - x
+            byte_r = y * 4 + (xr >> 2)
+            shift_r = 6 - (2 * (xr & 3))
+            out[byte_r] |= (shade << shift_r)
+    return bytes(out)
+
 class TikTokService:
     _cached_feed: List[Dict[str, Any]] = []
 
@@ -348,10 +371,17 @@ class TikTokService:
     def fetch_image_bitmap(url: str, w: int, h: int) -> Optional[bytes]:
         log("IMG", f"Tải bitmap {w}x{h}: {url}")
         try:
-            r = http_session.get(url, headers=DEFAULT_HEADERS, timeout=6)
+            img_headers = {
+                **DEFAULT_HEADERS,
+                "Referer": "https://www.tiktok.com/",
+                "Origin": "https://www.tiktok.com"
+            }
+            r = http_session.get(url, headers=img_headers, timeout=6)
             if r.status_code == 200:
                 img = Image.open(io.BytesIO(r.content))
                 return image_to_2bpp(img, w, h)
+            else:
+                log("IMG_ERR", f"Tải ảnh HTTP {r.status_code}: {url}")
         except Exception as e:
             log("IMG_ERR", f"Fetch image error: {e}")
         return None
@@ -394,6 +424,22 @@ class TikTokQRLogin:
                     self.confirmed_username = ""
                     log("QR", f"Token: {self.token}")
                     
+                    # Ưu tiên giải mã trực tiếp ảnh QR base64 của TikTok nếu có (chuẩn 100% từ TikTok)
+                    if data.get("qrcode"):
+                        try:
+                            qr_img = Image.open(io.BytesIO(base64.b64decode(data["qrcode"]))).convert('L')
+                            resized = qr_img.resize((54, 54), Image.Resampling.LANCZOS)
+                            row_bytes = (54 + 7) // 8
+                            out = bytearray(row_bytes * 54)
+                            for y in range(54):
+                                for x in range(54):
+                                    if resized.getpixel((x, y)) < 128:
+                                        out[y * row_bytes + (x // 8)] |= (1 << (7 - (x % 8)))
+                            log("QR", "Đã tạo bitmap 1bpp 54x54 trực tiếp từ ảnh gốc TikTok thành công!")
+                            return bytes(out), 54, 54
+                        except Exception as ex:
+                            log("QR_ERR", f"Lỗi parse base64 QR: {ex}")
+
                     qr = qrcode.QRCode(box_size=1, border=2, error_correction=qrcode.constants.ERROR_CORRECT_L)
                     qr.add_data(self.qr_url)
                     qr.make(fit=True)
@@ -429,7 +475,7 @@ class TikTokQRLogin:
         }
         if self.csrf_token:
             headers["x-tt-passport-csrf-token"] = self.csrf_token
-            headers["cookie"] = f"passport_csrf_token={self.csrf_token};"
+            http_session.cookies.set("passport_csrf_token", self.csrf_token)
 
         for url in api_urls:
             try:
@@ -585,12 +631,12 @@ class ClientSession:
                 if avt_url:
                     avt_bytes = await asyncio.to_thread(TikTokService.fetch_image_bitmap, avt_url, 16, 16)
 
-            if avt_bytes and len(avt_bytes) >= 64:
-                cmt_line = f"CMT|{c_author}|{c_text}|{c_likes}|0|0|vừa xong|1|0|0|1|100|0|0\n".encode('utf-8')
-                await self.send_packet(PKT_TEXT, cmt_line + avt_bytes[:64])
-            else:
-                cmt_line = f"CMT|{c_author}|{c_text}|{c_likes}|0|0|vừa xong|0|0|0|1|100|0|0"
-                await self.send_text(cmt_line)
+            if not avt_bytes or len(avt_bytes) < 64:
+                # Nếu không tải được hoặc bình luận offline: sinh avatar 16x16 2bpp đẹp mắt theo tên tác giả
+                avt_bytes = generate_identicon_2bpp(c_author, 16, 16)
+
+            cmt_line = f"CMT|{c_author}|{c_text}|{c_likes}|0|0|vừa xong|1|0|0|1|100|0|0\n".encode('utf-8')
+            await self.send_packet(PKT_TEXT, cmt_line + avt_bytes[:64])
 
     async def _stream_pipeline(self, play_url: str):
         log("FFMPEG", f"[{self.client_id}] Khởi tạo tiến trình FFmpeg...")
@@ -830,7 +876,7 @@ class ClientSession:
             log("CMD", f"[{self.client_id}] Tải thêm bình luận...")
             await self.handle_load_more_comments()
 
-        elif cmd_line == "CMD:LOGIN_QR":
+        elif cmd_line == "CMD:LOGIN_QR" or cmd_line == "CMD:LOGIN_REFRESH":
             await self.handle_login_qr()
 
         elif cmd_line == "CMD:LOGIN_CONFIRM":
@@ -868,12 +914,11 @@ class ClientSession:
                 if avt_url:
                     avt_bytes = await asyncio.to_thread(TikTokService.fetch_image_bitmap, avt_url, 16, 16)
 
-            if avt_bytes and len(avt_bytes) >= 64:
-                cmt_line = f"CMT|{c_author}|{c_text}|{c_likes}|0|0|vừa xong|1|0|0|1|100|0|0\n".encode('utf-8')
-                await self.send_packet(PKT_TEXT, cmt_line + avt_bytes[:64])
-            else:
-                cmt_line = f"CMT|{c_author}|{c_text}|{c_likes}|0|0|vừa xong|0|0|0|1|100|0|0"
-                await self.send_text(cmt_line)
+            if not avt_bytes or len(avt_bytes) < 64:
+                avt_bytes = generate_identicon_2bpp(c_author, 16, 16)
+
+            cmt_line = f"CMT|{c_author}|{c_text}|{c_likes}|0|0|vừa xong|1|0|0|1|100|0|0\n".encode('utf-8')
+            await self.send_packet(PKT_TEXT, cmt_line + avt_bytes[:64])
         await self.send_toast(f"Đã tải {len(next_batch)} bình luận")
 
     async def handle_login_qr(self):
@@ -888,14 +933,14 @@ class ClientSession:
             await self.send_toast("Lỗi tạo mã QR")
 
     async def _poll_qr_status(self):
-        for tick in range(35):
+        for tick in range(30):
             await asyncio.sleep(2)
             if not self.is_active or self.qr_service.status not in ["waiting", "scanned"]:
                 break
             res = await asyncio.to_thread(self.qr_service.check_status)
             st = res.get("status", "")
             if st == "scanned":
-                await self.send_text("QR_STATUS|scanned|Đã quét mã! Xác nhận trên máy...")
+                await self.send_text("QR_STATUS|scanned|Đã quét mã! Hãy xác nhận...")
             elif st == "confirmed":
                 await self.send_text("QR_STATUS|confirmed|Đăng nhập thành công!")
                 await self.send_toast("Đăng nhập thành công!")
@@ -903,11 +948,11 @@ class ClientSession:
                 await self.handle_profile_request(u)
                 break
             elif st == "expired":
-                await self.send_text("QR_STATUS|expired|Mã QR đã hết hạn! Bấm BACK")
+                await self.send_text("QR_STATUS|expired|Mã đã hết hạn! Bấm VAR để đổi mã")
                 break
         else:
             if self.is_active and self.qr_service.status == "waiting":
-                await self.send_text("QR_STATUS|timeout|Hết giờ quét mã. Bấm BACK")
+                await self.send_text("QR_STATUS|expired|Hết hạn mã! Bấm VAR để đổi mã mới")
 
     async def handle_profile_request(self, username: str):
         self.stop_streaming()
