@@ -51,34 +51,46 @@ DEFAULT_HEADERS = {
     "Accept-Language": "vi,en-US;q=0.9,en;q=0.8"
 }
 
+import numpy as np
+
+BAYER_NP = np.array(BAYER_4X4, dtype=np.float32)
+_TH_TILE_162 = np.tile(BAYER_NP, (FRAME_H // 4, (FRAME_W + 3) // 4))[:FRAME_H, :FRAME_W]
+_TH_MATRIX_162 = (_TH_TILE_162 / 16.0) * 85.0 - 42.5
+_PAD_COLS_162 = ((FRAME_W + 3) // 4) * 4 - FRAME_W
+
 def image_to_2bpp(img: Image.Image, target_w: int, target_h: int) -> bytes:
+    if target_w == FRAME_W and target_h == FRAME_H:
+        if img.mode != 'L':
+            img = img.convert('L')
+        if img.size != (FRAME_W, FRAME_H):
+            img = img.resize((FRAME_W, FRAME_H), Image.Resampling.LANCZOS)
+        arr = np.array(img, dtype=np.float32)
+        adj = arr + _TH_MATRIX_162
+        shades = np.zeros((FRAME_H, FRAME_W), dtype=np.uint8)
+        shades[adj >= 64.0] = 1
+        shades[adj >= 128.0] = 2
+        shades[adj >= 192.0] = 3
+        if _PAD_COLS_162 > 0:
+            shades = np.pad(shades, ((0, 0), (0, _PAD_COLS_162)), 'constant')
+        packed = (shades[:, 0::4] << 6) | (shades[:, 1::4] << 4) | (shades[:, 2::4] << 2) | shades[:, 3::4]
+        return packed.tobytes()
+
+    # Generic size fallback
     img = img.convert('L')
-    img = img.resize((target_w, target_h), Image.Resampling.LANCZOS)
-    pixels = img.load()
-    
-    row_bytes = (target_w + 3) // 4
-    out = bytearray(row_bytes * target_h)
-    
-    for y in range(target_h):
-        for x in range(target_w):
-            val = pixels[x, y]
-            threshold = (BAYER_4X4[y % 4][x % 4] / 16.0) * 85.0 - 42.5
-            val_adj = max(0.0, min(255.0, val + threshold))
-            
-            if val_adj < 64:
-                shade = 0
-            elif val_adj < 128:
-                shade = 1
-            elif val_adj < 192:
-                shade = 2
-            else:
-                shade = 3
-                
-            byte_idx = y * row_bytes + (x // 4)
-            bit_shift = 6 - 2 * (x % 4)
-            out[byte_idx] |= (shade << bit_shift)
-            
-    return bytes(out)
+    if img.size != (target_w, target_h):
+        img = img.resize((target_w, target_h), Image.Resampling.LANCZOS)
+    arr = np.array(img, dtype=np.float32)
+    th_tile = np.tile(BAYER_NP, ((target_h + 3) // 4, (target_w + 3) // 4))[:target_h, :target_w]
+    adj = arr + (th_tile / 16.0) * 85.0 - 42.5
+    shades = np.zeros((target_h, target_w), dtype=np.uint8)
+    shades[adj >= 64.0] = 1
+    shades[adj >= 128.0] = 2
+    shades[adj >= 192.0] = 3
+    pad_cols = ((target_w + 3) // 4) * 4 - target_w
+    if pad_cols > 0:
+        shades = np.pad(shades, ((0, 0), (0, pad_cols)), 'constant')
+    packed = (shades[:, 0::4] << 6) | (shades[:, 1::4] << 4) | (shades[:, 2::4] << 2) | shades[:, 3::4]
+    return packed.tobytes()
 
 def qr_matrix_to_1bpp(matrix: list, box_size: int = 2, max_size: int = 54) -> tuple[bytes, int, int]:
     """
@@ -341,16 +353,25 @@ class TikTokQRLogin:
         }
         log("QR", "Requesting new QR Token từ TikTok Web...")
         try:
+            # Bước 1: Ghé thăm trang login để nhận cookie phiên (ttwid, tt_csrf_token)
+            if not http_session.cookies.get("ttwid"):
+                http_session.get("https://www.tiktok.com/login", headers=DEFAULT_HEADERS, timeout=6)
+
+            csrf = http_session.cookies.get("passport_csrf_token", "")
+            if csrf:
+                qr_headers["x-tt-passport-csrf-token"] = csrf
+
             r = http_session.post(api_url, data={}, headers=qr_headers, timeout=8)
             if r.status_code == 200:
                 res = r.json()
-                if res.get("data", {}).get("token"):
-                    self.token = res["data"]["token"]
-                    self.qr_url = res["data"].get("qrcode_index_url", f"https://www.tiktok.com/login/qr?token={self.token}")
+                data = res.get("data", {})
+                if data.get("token"):
+                    self.token = data["token"]
+                    self.qr_url = data.get("qrcode_index_url", f"https://www.tiktok.com/login/qr?token={self.token}")
                     self.status = "waiting"
-                    self.csrf_token = r.cookies.get("passport_csrf_token", "")
+                    self.csrf_token = http_session.cookies.get("passport_csrf_token", "")
                     self.confirmed_username = ""
-                    log("QR", f"Token: {self.token}, URL: {self.qr_url}")
+                    log("QR", f"Token: {self.token}")
                     
                     qr = qrcode.QRCode(box_size=1, border=1, error_correction=qrcode.constants.ERROR_CORRECT_L)
                     qr.add_data(self.qr_url)
@@ -432,29 +453,51 @@ class ClientSession:
     async def send_toast(self, msg: str):
         await self.send_text(f"TOAST|{msg}")
 
-    def stop_streaming(self):
+    async def stop_streaming_async(self):
         log("STREAM", f"[{self.client_id}] Stopping existing FFmpeg pipelines...")
+        if self.stream_task and not self.stream_task.done():
+            self.stream_task.cancel()
+            try:
+                await self.stream_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self.stream_task = None
+
         if self.video_proc:
             try:
                 self.video_proc.terminate()
-                self.video_proc.wait(timeout=0.5)
+                self.video_proc.wait(timeout=0.3)
             except:
                 pass
             self.video_proc = None
         if self.audio_proc:
             try:
                 self.audio_proc.terminate()
-                self.audio_proc.wait(timeout=0.5)
+                self.audio_proc.wait(timeout=0.3)
+            except:
+                pass
+            self.audio_proc = None
+        log("STREAM", f"[{self.client_id}] FFmpeg pipelines stopped.")
+
+    def stop_streaming(self):
+        if self.video_proc:
+            try:
+                self.video_proc.terminate()
+            except:
+                pass
+            self.video_proc = None
+        if self.audio_proc:
+            try:
+                self.audio_proc.terminate()
             except:
                 pass
             self.audio_proc = None
         if self.stream_task and not self.stream_task.done():
             self.stream_task.cancel()
             self.stream_task = None
-        log("STREAM", f"[{self.client_id}] FFmpeg pipelines stopped.")
 
     async def play_current_video(self):
-        self.stop_streaming()
+        await self.stop_streaming_async()
         self.is_playing = True  # Luôn kích hoạt cờ phát khi chạy video mới!
         if not self.current_feed or self.current_video_idx >= len(self.current_feed):
             log("STREAM", f"[{self.client_id}] Feed rỗng hoặc idx vượt giới hạn ({self.current_video_idx}/{len(self.current_feed)})")
@@ -502,6 +545,8 @@ class ClientSession:
 
     async def _stream_pipeline(self, play_url: str):
         log("FFMPEG", f"[{self.client_id}] Khởi tạo tiến trình FFmpeg...")
+        video_proc = None
+        audio_proc = None
         try:
             fake_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             headers_str = f"Referer: https://www.tiktok.com/\r\nUser-Agent: {fake_agent}\r\n"
@@ -532,17 +577,21 @@ class ClientSession:
                 "-f", "s16le", "-"
             ]
 
-            self.video_proc = subprocess.Popen(video_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            self.audio_proc = subprocess.Popen(audio_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            log("FFMPEG", f"[{self.client_id}] Tiến trình Video (PID={self.video_proc.pid}), Audio (PID={self.audio_proc.pid}) đã khởi động!")
+            video_proc = subprocess.Popen(video_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            audio_proc = subprocess.Popen(audio_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            self.video_proc = video_proc
+            self.audio_proc = audio_proc
+            log("FFMPEG", f"[{self.client_id}] Tiến trình Video (PID={video_proc.pid}), Audio (PID={audio_proc.pid}) đã khởi động!")
 
             loop = asyncio.get_event_loop()
             raw_frame_size = FRAME_W * FRAME_H
             frame_idx = 0
+            INITIAL_BURST_FRAMES = 12
+            start_stream_time = time.time()
             
             while self.is_active and self.is_playing:
                 frame_start = time.time()
-                raw_gray = await loop.run_in_executor(None, self.video_proc.stdout.read, raw_frame_size)
+                raw_gray = await loop.run_in_executor(None, video_proc.stdout.read, raw_frame_size)
                 if not raw_gray or len(raw_gray) < raw_frame_size:
                     log("STREAM", f"[{self.client_id}] Hết luồng video từ FFmpeg stdout.")
                     break
@@ -557,7 +606,7 @@ class ClientSession:
                 audio_bytes_needed = target_audio_bytes
                 while audio_bytes_needed > 0:
                     chunk_to_read = min(AUDIO_CHUNK_SIZE, audio_bytes_needed)
-                    audio_chunk = await loop.run_in_executor(None, self.audio_proc.stdout.read, chunk_to_read)
+                    audio_chunk = await loop.run_in_executor(None, audio_proc.stdout.read, chunk_to_read)
                     if not audio_chunk:
                         break
                     await self.send_packet(PKT_AUDIO, audio_chunk)
@@ -566,21 +615,44 @@ class ClientSession:
                 if frame_idx % 60 == 0:
                     log("STREAM", f"[{self.client_id}] Đã stream {frame_idx} frames (~{frame_idx//12} giây)")
 
-                elapsed = time.time() - frame_start
-                sleep_time = max(0.002, (1.0 / 12.0) - elapsed)
-                await asyncio.sleep(sleep_time)
+                # Giai đoạn nạp đệm ban đầu: gửi tốc độ cao để ESP32 có buffer đệm chống giật
+                if frame_idx <= INITIAL_BURST_FRAMES:
+                    await asyncio.sleep(0.005)
+                    start_stream_time = time.time() - (INITIAL_BURST_FRAMES / 12.0)
+                else:
+                    # Pacing chuẩn 12 FPS không tích lũy trễ
+                    expected_time = start_stream_time + (frame_idx / 12.0)
+                    sleep_time = max(0.002, expected_time - time.time())
+                    await asyncio.sleep(sleep_time)
 
             if self.is_active and self.is_playing:
-                log("STREAM", f"[{self.client_id}] Chuyển tiếp sang video kế tiếp...")
+                # TẮT CHẾ ĐỘ TỰ LƯỚT: Lặp lại video hiện tại (giống app TikTok)
+                log("STREAM", f"[{self.client_id}] Video kết thúc -> Lặp lại video hiện tại (tắt tự lướt)...")
                 await asyncio.sleep(0.3)
-                await self.handle_command("CMD:NEXT_VIDEO")
+                if self.is_active and self.is_playing:
+                    self.stream_task = asyncio.create_task(self._stream_pipeline(play_url))
 
         except asyncio.CancelledError:
             log("STREAM", f"[{self.client_id}] Stream task cancelled.")
         except Exception as e:
             log("STREAM_ERR", f"[{self.client_id}] Pipeline error: {e}")
         finally:
-            self.stop_streaming()
+            if video_proc:
+                try:
+                    video_proc.terminate()
+                    video_proc.wait(timeout=0.3)
+                except:
+                    pass
+            if audio_proc:
+                try:
+                    audio_proc.terminate()
+                    audio_proc.wait(timeout=0.3)
+                except:
+                    pass
+            if self.video_proc == video_proc:
+                self.video_proc = None
+            if self.audio_proc == audio_proc:
+                self.audio_proc = None
 
     async def handle_command(self, cmd_line: str):
         cmd_line = cmd_line.strip()
