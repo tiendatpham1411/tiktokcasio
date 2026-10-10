@@ -143,8 +143,7 @@ class TikTokService:
     @staticmethod
     def fetch_feed(count: int = 10) -> List[Dict[str, Any]]:
         endpoints = [
-            "https://www.tikwm.com/api/feed/list",
-            "https://api.tikwm.com/api/feed/list"
+            "https://www.tikwm.com/api/feed/list"
         ]
         params = {"region": "vn", "count": count}
         
@@ -175,13 +174,13 @@ class TikTokService:
             log("API", f"Sử dụng {len(TikTokService._cached_feed)} videos từ bộ đệm feed!")
             return TikTokService._cached_feed
 
-        log("API", "Kích hoạt danh sách video mẫu đa dạng Fallback...")
+        log("API", "Kích hoạt danh sách video mẫu dự phòng (Archive.org/W3Schools)...")
         return [
             {
                 "id": "sample_video_1",
-                "title": "FebonOS Demo Stream (Big Buck Bunny)",
-                "play": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4",
-                "author": {"unique_id": "casio_fx580"},
+                "title": "FebonOS Big Buck Bunny",
+                "play": "https://archive.org/download/BigBuckBunny_124/Content/big_buck_bunny_720p_surround.mp4",
+                "author": {"unique_id": "casio_fx880"},
                 "digg_count": 12500,
                 "comment_count": 128,
                 "music_info": {"title": "Casio Sound Synthesizer"}
@@ -189,7 +188,7 @@ class TikTokService:
             {
                 "id": "sample_video_2",
                 "title": "FebonOS Elephants Dream",
-                "play": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4",
+                "play": "https://archive.org/download/ElephantsDream/ed_1024_512kb.mp4",
                 "author": {"unique_id": "febonos_team"},
                 "digg_count": 8800,
                 "comment_count": 95,
@@ -197,8 +196,8 @@ class TikTokService:
             },
             {
                 "id": "sample_video_3",
-                "title": "FebonOS For Bigger Blazes",
-                "play": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4",
+                "title": "FebonOS Open Video Demo",
+                "play": "https://www.w3schools.com/html/mov_bbb.mp4",
                 "author": {"unique_id": "hanoitech"},
                 "digg_count": 9999,
                 "comment_count": 210,
@@ -207,7 +206,7 @@ class TikTokService:
             {
                 "id": "sample_video_4",
                 "title": "FebonOS Tears of Steel",
-                "play": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/TearsOfSteel.mp4",
+                "play": "https://archive.org/download/Tears-of-Steel/tears_of_steel_720p.mp4",
                 "author": {"unique_id": "embedded_dev"},
                 "digg_count": 15400,
                 "comment_count": 340,
@@ -217,52 +216,46 @@ class TikTokService:
 
     @staticmethod
     def search_videos(query: str, count: int = 10) -> List[Dict[str, Any]]:
-        endpoints = [
-            "https://www.tikwm.com/api/feed/search",
-            "https://api.tikwm.com/api/feed/search"
-        ]
-        params = {"keywords": query, "count": count}
         log("API", f"Searching videos for: '{query}'")
-        for url in endpoints:
-            try:
-                r = http_session.get(url, params=params, headers=DEFAULT_HEADERS, timeout=(5, 10))
-                if r.status_code == 200:
-                    data = r.json()
-                    if data.get("code") == 0 and "data" in data:
-                        res = data["data"]
-                        items = res.get("videos", res) if isinstance(res, dict) else res
-                        if items and len(items) > 0:
-                            log("API", f"Tìm thấy {len(items)} kết quả cho '{query}'")
-                            return items
-            except Exception as e:
-                log("API_ERR", f"Search error {url}: {e}")
-
-        # Tìm kiếm dự phòng trong bộ đệm video đã tải
         q_lower = query.lower()
+
+        # 1. Thử gọi API TikWM search
+        url = "https://www.tikwm.com/api/feed/search"
+        params = {"keywords": query, "count": count}
+        try:
+            r = http_session.get(url, params=params, headers=DEFAULT_HEADERS, timeout=(4, 8))
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("code") == 0 and "data" in data:
+                    res = data["data"]
+                    items = res.get("videos", res) if isinstance(res, dict) else res
+                    if items and len(items) > 0:
+                        log("API", f"Tìm thấy {len(items)} kết quả TikWM cho '{query}'")
+                        return items
+        except Exception as e:
+            log("API_ERR", f"Search TikWM error: {e}")
+
+        # 2. Tìm kiếm thông minh trong feed đã cache hoặc nạp thêm feed mới
+        if not TikTokService._cached_feed:
+            TikTokService.fetch_feed(30)
+
         matched = [v for v in TikTokService._cached_feed if q_lower in v.get("title", "").lower() or q_lower in v.get("author", {}).get("unique_id", "").lower()]
         if matched:
-            log("API", f"Tìm thấy {len(matched)} video khớp từ cache cho '{query}'")
+            log("API", f"Tìm thấy {len(matched)} video khớp từ feed cho '{query}'")
             return matched
 
-        # Fallback video gợi ý theo từ khóa
-        log("API", f"Trả về video mẫu gợi ý cho từ khóa '{query}'")
-        return [
-            {
-                "id": f"search_{query}_1",
-                "title": f"FebonOS Search: {query}",
-                "play": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4",
-                "author": {"unique_id": query},
-                "digg_count": 1024,
-                "comment_count": 42,
-                "music_info": {"title": f"Soundtrack - {query}"}
-            }
-        ]
+        # 3. Nếu không có video trùng khớp chính xác từ khóa, trả về các video thịnh hành từ feed thật
+        if TikTokService._cached_feed:
+            log("API", f"Không có video khớp '{query}', trả về {count} video thịnh hành từ feed thật")
+            return TikTokService._cached_feed[:count]
+
+        # 4. Fallback video mẫu nếu mất mạng
+        return TikTokService.fetch_feed(count)
 
     @staticmethod
     def fetch_user_info(unique_id: str) -> Optional[Dict[str, Any]]:
         endpoints = [
-            "https://www.tikwm.com/api/user/info",
-            "https://api.tikwm.com/api/user/info"
+            "https://www.tikwm.com/api/user/info"
         ]
         clean_id = unique_id.lstrip("@").strip() if unique_id else "tiktok"
         if not clean_id:
@@ -298,8 +291,7 @@ class TikTokService:
     @staticmethod
     def fetch_user_posts(unique_id: str, count: int = 12) -> List[Dict[str, Any]]:
         endpoints = [
-            "https://www.tikwm.com/api/user/posts",
-            "https://api.tikwm.com/api/user/posts"
+            "https://www.tikwm.com/api/user/posts"
         ]
         clean_id = unique_id.lstrip("@").strip() if unique_id else "tiktok"
         params = {"unique_id": clean_id, "count": count, "cursor": 0}
@@ -318,9 +310,17 @@ class TikTokService:
 
     @staticmethod
     def fetch_comments(video_url: str, count: int = 30) -> List[Dict[str, Any]]:
+        # Không gọi TikWM nếu là video mẫu, video tìm kiếm giả lập, hoặc URL không thuộc TikTok
+        if not video_url or "sample_video" in video_url or "archive.org" in video_url or "w3schools" in video_url or "search_" in video_url or "tiktok.com" not in video_url:
+            log("API", f"Dùng bình luận mẫu dự phòng cho video không phải TikTok: {video_url}")
+            return [
+                {"user": {"unique_id": "casio_user"}, "text": "App chạy trên máy tính cầm tay mượt quá!", "digg_count": 88},
+                {"user": {"unique_id": "febonos_fan"}, "text": "Chất lượng hình ảnh 2bpp rất rõ ràng", "digg_count": 45},
+                {"user": {"unique_id": "vietnam_tech"}, "text": "Đỉnh cao công nghệ nhúng ESP32-S3", "digg_count": 29}
+            ]
+
         endpoints = [
-            "https://www.tikwm.com/api/comment/list",
-            "https://api.tikwm.com/api/comment/list"
+            "https://www.tikwm.com/api/comment/list"
         ]
         params = {"url": video_url, "count": count, "cursor": 0}
         log("API", f"Fetching comments for: {video_url}")
@@ -337,7 +337,7 @@ class TikTokService:
             except Exception as e:
                 log("API_ERR", f"Comments error {url}: {e}")
         
-        # Bình luận mẫu dự phòng
+        # Bình luận mẫu dự phòng nếu TikWM lỗi
         return [
             {"user": {"unique_id": "casio_user"}, "text": "App chạy trên máy tính cầm tay mượt quá!", "digg_count": 88},
             {"user": {"unique_id": "febonos_fan"}, "text": "Chất lượng hình ảnh 2bpp rất rõ ràng", "digg_count": 45},
@@ -575,7 +575,11 @@ class ClientSession:
         audio_proc = None
         try:
             fake_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            headers_str = f"Referer: https://www.tiktok.com/\r\nUser-Agent: {fake_agent}\r\n"
+            is_tiktok_url = any(k in play_url.lower() for k in ["tiktok", "byteoversea", "ibytedtos"])
+            if is_tiktok_url:
+                headers_str = f"Referer: https://www.tiktok.com/\r\nUser-Agent: {fake_agent}\r\n"
+            else:
+                headers_str = f"User-Agent: {fake_agent}\r\n"
 
             # Bổ sung các cờ chống treo mạng và vượt qua kiểm tra Referer của TikTok CDN
             net_opts = [
@@ -665,11 +669,16 @@ class ClientSession:
                     await asyncio.sleep(sleep_time)
 
             if self.is_active and self.is_playing:
-                # TẮT CHẾ ĐỘ TỰ LƯỚT: Lặp lại video hiện tại (giống app TikTok)
-                log("STREAM", f"[{self.client_id}] Video kết thúc -> Lặp lại video hiện tại (tắt tự lướt)...")
-                await asyncio.sleep(0.3)
-                if self.is_active and self.is_playing:
-                    self.stream_task = asyncio.create_task(self._stream_pipeline(play_url))
+                if frame_idx == 0:
+                    log("STREAM_ERR", f"[{self.client_id}] Không nhận được frame nào từ luồng video (frame_idx = 0). Dừng phát để tránh lặp vô hạn.")
+                    await self.send_toast("Lỗi tải video từ nguồn!")
+                    self.is_playing = False
+                else:
+                    # TẮT CHẾ ĐỘ TỰ LƯỚT: Lặp lại video hiện tại (giống app TikTok)
+                    log("STREAM", f"[{self.client_id}] Video kết thúc -> Lặp lại video hiện tại (tắt tự lướt)...")
+                    await asyncio.sleep(0.3)
+                    if self.is_active and self.is_playing:
+                        self.stream_task = asyncio.create_task(self._stream_pipeline(play_url))
 
         except asyncio.CancelledError:
             log("STREAM", f"[{self.client_id}] Stream task cancelled.")
@@ -800,6 +809,14 @@ class ClientSession:
 
         elif cmd_line == "CMD:LOGIN_QR":
             await self.handle_login_qr()
+
+        elif cmd_line == "CMD:LOGIN_CONFIRM":
+            log("CMD", f"[{self.client_id}] Người dùng xác nhận đăng nhập.")
+            self.qr_service.status = "confirmed"
+            await self.send_text("QR_STATUS|confirmed|Đăng nhập thành công!")
+            await self.send_toast("Đăng nhập thành công!")
+            u = self.qr_service.confirmed_username if self.qr_service.confirmed_username else "tiktok"
+            await self.handle_profile_request(u)
 
     async def handle_load_more_comments(self):
         if not self.all_comments or self.comments_sent_idx >= len(self.all_comments):
