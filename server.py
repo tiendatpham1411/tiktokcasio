@@ -565,9 +565,32 @@ class ClientSession:
         for c in comments[:self.comments_sent_idx]:
             c_author = c.get("user", {}).get("unique_id", "user").replace("|", " ")
             c_text = c.get("text", "").replace("\n", " ").replace("|", " ")
+            # Lọc bỏ emoji và ký tự 4-byte UTF-8 ngoài BMP để bảo vệ font vector FreeType
+            c_text = "".join(ch for ch in c_text if ord(ch) < 0x10000)
             c_likes = str(c.get("digg_count", 0))
-            cmt_line = f"CMT|{c_author}|{c_text}|{c_likes}|0|0|vừa xong|0|0|0|1|100|0|0"
-            await self.send_text(cmt_line)
+
+            # Tìm và tải avatar thật từ TikTok (kích thước 16x16 2bpp = 64 bytes)
+            avt_bytes = None
+            user_obj = c.get("user", {})
+            if isinstance(user_obj, dict):
+                avt_thumb = user_obj.get("avatar_thumb")
+                avt_url = ""
+                if isinstance(avt_thumb, dict) and avt_thumb.get("url_list"):
+                    avt_url = avt_thumb["url_list"][0]
+                elif isinstance(avt_thumb, str) and avt_thumb.startswith("http"):
+                    avt_url = avt_thumb
+                elif user_obj.get("avatar_168x168"):
+                    avt_url = user_obj.get("avatar_168x168")
+
+                if avt_url:
+                    avt_bytes = await asyncio.to_thread(TikTokService.fetch_image_bitmap, avt_url, 16, 16)
+
+            if avt_bytes and len(avt_bytes) >= 64:
+                cmt_line = f"CMT|{c_author}|{c_text}|{c_likes}|0|0|vừa xong|1|0|0|1|100|0|0\n".encode('utf-8')
+                await self.send_packet(PKT_TEXT, cmt_line + avt_bytes[:64])
+            else:
+                cmt_line = f"CMT|{c_author}|{c_text}|{c_likes}|0|0|vừa xong|0|0|0|1|100|0|0"
+                await self.send_text(cmt_line)
 
     async def _stream_pipeline(self, play_url: str):
         log("FFMPEG", f"[{self.client_id}] Khởi tạo tiến trình FFmpeg...")
@@ -629,7 +652,7 @@ class ClientSession:
             loop = asyncio.get_event_loop()
             raw_frame_size = FRAME_W * FRAME_H
             frame_idx = 0
-            INITIAL_BURST_FRAMES = 12
+            INITIAL_BURST_FRAMES = 48 # Nạp đệm nhanh 4 giây đầu vào PSRAM để phát mượt mà
             start_stream_time = time.time()
             
             while self.is_active and self.is_playing:
@@ -827,9 +850,30 @@ class ClientSession:
         for c in next_batch:
             c_author = c.get("user", {}).get("unique_id", "user").replace("|", " ")
             c_text = c.get("text", "").replace("\n", " ").replace("|", " ")
+            c_text = "".join(ch for ch in c_text if ord(ch) < 0x10000)
             c_likes = str(c.get("digg_count", 0))
-            cmt_line = f"CMT|{c_author}|{c_text}|{c_likes}|0|0|vừa xong|0|0|0|1|100|0|0"
-            await self.send_text(cmt_line)
+
+            avt_bytes = None
+            user_obj = c.get("user", {})
+            if isinstance(user_obj, dict):
+                avt_thumb = user_obj.get("avatar_thumb")
+                avt_url = ""
+                if isinstance(avt_thumb, dict) and avt_thumb.get("url_list"):
+                    avt_url = avt_thumb["url_list"][0]
+                elif isinstance(avt_thumb, str) and avt_thumb.startswith("http"):
+                    avt_url = avt_thumb
+                elif user_obj.get("avatar_168x168"):
+                    avt_url = user_obj.get("avatar_168x168")
+
+                if avt_url:
+                    avt_bytes = await asyncio.to_thread(TikTokService.fetch_image_bitmap, avt_url, 16, 16)
+
+            if avt_bytes and len(avt_bytes) >= 64:
+                cmt_line = f"CMT|{c_author}|{c_text}|{c_likes}|0|0|vừa xong|1|0|0|1|100|0|0\n".encode('utf-8')
+                await self.send_packet(PKT_TEXT, cmt_line + avt_bytes[:64])
+            else:
+                cmt_line = f"CMT|{c_author}|{c_text}|{c_likes}|0|0|vừa xong|0|0|0|1|100|0|0"
+                await self.send_text(cmt_line)
         await self.send_toast(f"Đã tải {len(next_batch)} bình luận")
 
     async def handle_login_qr(self):
