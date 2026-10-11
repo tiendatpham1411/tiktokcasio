@@ -698,7 +698,7 @@ class ClientSession:
             loop = asyncio.get_event_loop()
             raw_frame_size = FRAME_W * FRAME_H
             frame_idx = 0
-            INITIAL_BURST_FRAMES = 48 # Nạp đệm nhanh 4 giây đầu vào PSRAM để phát mượt mà
+            INITIAL_BURST_FRAMES = 12 # Nạp đệm nhanh 1 giây đầu (72 chunks) để phát mượt mà không gây ngập tràn buffer
             start_stream_time = time.time()
             
             while self.is_active and self.is_playing:
