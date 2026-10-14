@@ -583,6 +583,7 @@ class TikTokQRLogin:
     self.status = "idle"
     self.csrf_token = ""
     self.confirmed_username = ""
+    self.base_origin = "https://www.tiktok.com"
 
   def request_new_qr(self) -> Optional[tuple[bytes, int, int]]:
     api_url = (
@@ -592,22 +593,40 @@ class TikTokQRLogin:
     )
     qr_headers = {
         **DEFAULT_HEADERS,
-        "Referer": "https://www.tiktok.com/login/phone-or-email",
+        "Referer": "https://www.tiktok.com/login",
         "Origin": "https://www.tiktok.com",
     }
-    log("QR", "Requesting new QR Token từ TikTok Web...")
+    log("QR_DBG", "1. Đang khởi tạo phiên cookie tại tiktok.com/login...")
     try:
-      self.session.get(
+      r_init = self.session.get(
           "https://www.tiktok.com/login", headers=DEFAULT_HEADERS, timeout=6
       )
-      csrf = self.session.cookies.get("passport_csrf_token", "") or (
-          self.session.cookies.get("tt_csrf_token", "")
+      # Lưu lại domain thực tế sau khi TikTok redirect (nếu có)
+      if r_init.url:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(r_init.url)
+        self.base_origin = f"{parsed.scheme}://{parsed.netloc}"
+
+      cookies_dict = self.session.cookies.get_dict()
+      csrf = (
+          cookies_dict.get("passport_csrf_token")
+          or cookies_dict.get("passport_csrf_token_default")
+          or cookies_dict.get("tt_csrf_token")
+          or ""
       )
+      log(
+          "QR_DBG",
+          f"2. Cookies nhận được: {list(cookies_dict.keys())} | CSRF: {csrf[:10]}...",
+      )
+
       if csrf:
         qr_headers["x-tt-passport-csrf-token"] = csrf
         self.csrf_token = csrf
 
       r = self.session.post(api_url, data={}, headers=qr_headers, timeout=8)
+      log("QR_DBG", f"3. get_qrcode HTTP={r.status_code} | Body={r.text[:220]}")
+
       if r.status_code == 200:
         res = r.json()
         data = res.get("data", {})
@@ -619,9 +638,8 @@ class TikTokQRLogin:
           )
           self.status = "waiting"
           self.confirmed_username = ""
-          log("QR", f"Nhận thành công QR Token: {self.token[:16]}...")
+          log("QR_DBG", f"4. Tạo QR thành công! Token={self.token[:18]}...")
 
-          # Dựng mã QR sắc nét bằng Integer Scaling để camera điện thoại bắt nét tức thì
           qr = qrcode.QRCode(
               box_size=1,
               border=2,
@@ -630,78 +648,114 @@ class TikTokQRLogin:
           qr.add_data(self.qr_url)
           qr.make(fit=True)
           return qr_matrix_to_1bpp(qr.get_matrix(), box_size=2, max_size=56)
-
-          # Nếu URL quá dài, giải mã trực tiếp ảnh gốc base64 của TikTok với ngưỡng NEAREST
-        if data.get("qrcode"):
-          raw_b64 = data["qrcode"]
-          if "," in raw_b64:
-            raw_b64 = raw_b64.split(",", 1)[1]
-          qr_img = Image.open(io.BytesIO(base64.b64decode(raw_b64))).convert(
-              "L"
-          )
-          resized = qr_img.resize((54, 54), Image.Resampling.NEAREST)
-          row_bytes = (54 + 7) // 8
-          out = bytearray(row_bytes * 54)
-          for y in range(54):
-            for x in range(54):
-              if resized.getpixel((x, y)) < 128:
-                out[y * row_bytes + (x // 8)] |= 1 << (7 - (x % 8))
-          return bytes(out), 54, 54
     except Exception as e:
-      log("QR_ERR", f"Request QR error: {e}")
+      log("QR_ERR", f"Request QR Exception: {e}")
 
-    log("QR", "Tạo mã QR dự phòng...")
-    self.token = f"casio_{int(time.time())}"
-    self.qr_url = f"https://www.tiktok.com/login/qr?token={self.token}"
-    self.status = "waiting"
-    self.confirmed_username = "tiktok"
-    qr = qrcode.QRCode(
-        box_size=1, border=2, error_correction=qrcode.constants.ERROR_CORRECT_L
-    )
-    qr.add_data(self.qr_url)
-    qr.make(fit=True)
-    return qr_matrix_to_1bpp(qr.get_matrix(), box_size=2, max_size=56)
+    return None
 
   def check_status(self) -> Dict[str, Any]:
     if not self.token:
       return {"status": "idle"}
-    if self.token.startswith("casio_"):
-      return {"status": "waiting"}
 
-    api_urls = [
-        (
-            "https://www.tiktok.com/passport/web/check_qrconnect/"
-            f"?next=https%3A%2F%2Fwww.tiktok.com&token={self.token}&aid=1459"
-        ),
-        (
-            "https://web-va.tiktok.com/passport/web/check_qrconnect/"
-            f"?next=https%3A%2F%2Fwww.tiktok.com&token={self.token}&aid=1459"
-        ),
-    ]
+    # Phải truyền đầy đủ tham số giống hệt lúc gọi get_qrcode
+    check_url = f"{self.base_origin}/passport/web/check_qrconnect/"
+    params = {
+        "next": "https://www.tiktok.com",
+        "token": self.token,
+        "aid": "1459",
+        "sdk_version": "2.1.5-tiktok",
+        "device_platform": "web_pc",
+    }
     headers = {
         **DEFAULT_HEADERS,
         "Referer": "https://www.tiktok.com/login",
+        "Origin": self.base_origin,
     }
     if self.csrf_token:
       headers["x-tt-passport-csrf-token"] = self.csrf_token
 
-    for url in api_urls:
-      try:
-        r = self.session.get(url, headers=headers, timeout=5)
-        if r.status_code == 200:
-          data = r.json().get("data", {})
-          st = data.get("status", "")
-          if st in ["confirmed", "scanned", "expired"]:
-            self.status = st
-            log("QR", f"QR Status changed -> {st}")
-            if st == "confirmed":
-              self.confirmed_username = (
-                  data.get("screen_name") or data.get("user_id") or "tiktok"
-              )
-            return {"status": st, "data": data}
-      except Exception as e:
-        log("QR_ERR", f"Check status error: {e}")
+    try:
+      r = self.session.get(check_url, params=params, headers=headers, timeout=6)
+      cookies_now = self.session.cookies.get_dict()
+
+      # IN LOG DEBUG CHI TIẾT MỖI LẦN POLL ĐỂ BẠN THEO DÕI TRÊN RENDER
+      log(
+          "QR_POLL_DBG",
+          f"HTTP={r.status_code} | Body={r.text[:250]} | Cookies={list(cookies_now.keys())}",
+      )
+
+      if r.status_code == 200:
+        res_json = r.json()
+        data = res_json.get("data", {})
+        if not isinstance(data, dict):
+          data = {}
+
+        raw_st = str(data.get("status", "")).lower().strip()
+        err_code = data.get("error_code", 0)
+        redirect_url = data.get("redirect_url", "")
+
+        # Kiểm tra xem TikTok đã cấp cookie đăng nhập (sessionid / sid_tt) chưa
+        has_session_cookie = any(
+            k in cookies_now
+            for k in ["sessionid", "sessionid_ss", "sid_tt", "uid_tt"]
+        )
+
+        # Bắt mọi trường hợp TikTok báo ĐÃ QUÉT MÃ
+        if raw_st in ["scanned", "scan", "2"]:
+          self.status = "scanned"
+          return {"status": "scanned", "data": data}
+
+        # Bắt mọi trường hợp TikTok báo ĐÃ XÁC NHẬN THÀNH CÔNG
+        if (
+            raw_st in ["confirmed", "confirm", "success", "3"]
+            or bool(redirect_url)
+            or has_session_cookie
+        ):
+          self.status = "confirmed"
+          log("QR_DBG", ">>> XÁC NHẬN ĐĂNG NHẬP QR THÀNH CÔNG! <<<")
+
+          # Gọi tiếp redirect_url (nếu có) để hoàn tất gắn cookie phiên và lấy thông tin tài khoản
+          if redirect_url:
+            try:
+              self.session.get(redirect_url, headers=headers, timeout=5)
+            except Exception:
+              pass
+
+          self.confirmed_username = (
+              data.get("screen_name")
+              or data.get("unique_id")
+              or data.get("username")
+              or self._fetch_logged_in_username()
+              or "tiktok"
+          )
+          return {"status": "confirmed", "data": data}
+
+        if raw_st in ["expired", "expire", "4"] or err_code in [1031, 1032]:
+          self.status = "expired"
+          return {"status": "expired", "data": data}
+
+    except Exception as e:
+      log("QR_ERR", f"Check status exception: {e}")
+
     return {"status": self.status}
+
+  def _fetch_logged_in_username(self) -> str:
+    """Lấy username thật của tài khoản vừa đăng nhập từ cookie phiên."""
+    try:
+      r = self.session.get(
+          "https://www.tiktok.com/passport/web/account/info/?aid=1459",
+          headers=DEFAULT_HEADERS,
+          timeout=5,
+      )
+      if r.status_code == 200:
+        d = r.json().get("data", {})
+        uname = d.get("username") or d.get("screen_name") or ""
+        if uname:
+          log("QR_DBG", f"Lấy được username từ session: @{uname}")
+          return uname
+    except Exception as e:
+      log("QR_ERR", f"Fetch account info error: {e}")
+    return ""
 
 
 class ClientSession:
@@ -1169,29 +1223,42 @@ class ClientSession:
       await self.send_toast("Lỗi tạo mã QR")
 
   async def _poll_qr_status(self):
-    try:
-      for _ in range(30):
-        await asyncio.sleep(2.0)
-        if not self.is_active or self.qr_service.status not in [
-            "waiting",
-            "scanned",
-        ]:
-          break
-        res = await asyncio.to_thread(self.qr_service.check_status)
-        st = res.get("status", "")
-        if st == "scanned":
-          await self.send_text("QR_STATUS|scanned|Đã quét! Bấm xác nhận trên ĐT")
-        elif st == "confirmed":
-          await self.send_text("QR_STATUS|confirmed|Đăng nhập thành công!")
-          await self.send_toast("Đăng nhập thành công!")
-          u = self.qr_service.confirmed_username or "tiktok"
-          await self.handle_profile_request(u)
-          break
-        elif st == "expired":
-          await self.send_text("QR_STATUS|expired|Hết hạn! Bấm VAR để đổi mã")
-          break
-    except asyncio.CancelledError:
-      pass
+      last_sent_st = ""
+      try:
+        for tick in range(45):  # Tăng thời gian theo dõi lên 90 giây
+          await asyncio.sleep(2.0)
+          if not self.is_active or self.qr_service.status not in [
+              "waiting",
+              "scanned",
+          ]:
+            break
+          res = await asyncio.to_thread(self.qr_service.check_status)
+          st = res.get("status", "")
+
+          if st == "scanned" and last_sent_st != "scanned":
+            last_sent_st = "scanned"
+            await self.send_text(
+                "QR_STATUS|scanned|Đã quét! Bấm Xác nhận trên ĐT"
+            )
+            await self.send_toast("Điện thoại đã quét mã!")
+          elif st == "confirmed":
+            await self.send_text("QR_STATUS|confirmed|Đăng nhập thành công!")
+            await self.send_toast("Đăng nhập thành công!")
+            u = self.qr_service.confirmed_username or "tiktok"
+            await self.handle_profile_request(u)
+            break
+          elif st == "expired":
+            await self.send_text(
+                "QR_STATUS|expired|Hết hạn! Bấm VAR để đổi mã"
+            )
+            break
+          elif st == "waiting" and tick % 3 == 0:
+            # Cập nhật nhịp đếm trên màn hình Casio để bạn biết Server vẫn đang poll sống
+            await self.send_text(
+                f"QR_STATUS|waiting|Đang chờ quét... (poll #{tick+1})"
+            )
+      except asyncio.CancelledError:
+        pass
 
   async def handle_profile_request(self, username: str):
     await self.stop_streaming_async()
