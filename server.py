@@ -267,6 +267,7 @@ class TikTokService:
         "digg_count": v.get("digg_count", 0),
         "comment_count": v.get("comment_count", 0),
         "play_count": v.get("play_count", 0),
+        "duration": int(v.get("duration", 0)),
         "music_info": {"title": clean_utf8_bmp(str(music_title))},
     }
 
@@ -852,7 +853,8 @@ class ClientSession:
         video_info.get("music_info", {}).get("title", "Âm thanh gốc")
     )[:30]
 
-    meta_line = f"META|{title}|@{author.lstrip('@')}|{likes}|{cmts}|{music}|0"
+    dur = int(video_info.get("duration", 0))
+    meta_line = f"META|{title}|@{author.lstrip('@')}|{likes}|{cmts}|{music}|0|{dur}"
     self.last_meta_line = meta_line
     log(
         "STREAM",
